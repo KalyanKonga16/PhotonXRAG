@@ -130,7 +130,18 @@ SUGGESTED_QUESTIONS = [
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Warming up the copilot...")
 def get_resources():
-    return load_resources()
+    try:
+        return load_resources()
+    except RuntimeError:
+        # First run on a fresh deploy (Streamlit Cloud, HF Spaces, etc.) -- the
+        # container has the repo's source_docs/ but no chroma_db/ yet, since
+        # that's generated output, not something we commit. Build it once,
+        # here, instead of requiring a manual `python ingest.py` step that's
+        # easy to forget after every redeploy.
+        import ingest
+        with st.spinner("First run on this deployment: indexing PhotonX documents..."):
+            ingest.run(source_dir=ingest.SOURCE_DIR)
+        return load_resources()
 
 
 # ---------------------------------------------------------------------------
