@@ -36,22 +36,15 @@ BM25_TOP_K = 20
 RRF_K = 60           # reciprocal rank fusion constant
 FINAL_TOP_N = 6       # hard ceiling -- upper bound on chunks sent to the LLM
 
-# bge-reranker-base outputs a raw relevance logit per (query, chunk) pair, not
-# a 0-1 probability, and on a small single-document corpus like this one, an
-# absolute floor alone isn't enough: nearly every chunk shares enough
-# company-wide vocabulary ("PhotonX", "AI", "digital") to score mildly
-# positive even when it isn't actually about the question asked. So a chunk
-# has to clear BOTH of these:
-#   1. RERANK_SCORE_THRESHOLD -- a floor in absolute terms (not just barely
-#      non-negative)
-#   2. RERANK_RELATIVE_MARGIN -- close enough to this query's *best* match,
-#      not just positive in isolation. A chunk that's 5+ points behind the
-#      top hit is a weak tag-along, however positive its raw score is.
-# These two numbers are the knob to turn if results feel too strict/loose --
-# try a few real questions, and tighten (lower the margin) or loosen (raise
-# it) based on whether unrelated sections are still slipping through.
-RERANK_SCORE_THRESHOLD = 1.5
-RERANK_RELATIVE_MARGIN = 3.0
+# We don't have a reliable way to hand-pick an absolute reranker-score
+# threshold offline (its raw logit scale isn't something we can calibrate
+# without seeing real score distributions from this corpus), and two
+# attempts at fixed numbers proved it either way: too loose let unrelated
+# sections through, too strict collapsed every query down to one source.
+# Instead, _select_relevant() below looks at each query's own ranked score
+# list and cuts at the first real "cliff" -- a drop-off that's large
+# relative to that query's own spread of scores -- rather than a fixed
+# number tuned to a scale we can't see. See that function for how.
 
 # How many fused candidates get handed to the (more expensive) cross-encoder
 # reranker. This used to be max(DENSE_TOP_K, BM25_TOP_K) = 15, which silently
@@ -170,6 +163,46 @@ def _id_to_doc(res: RagResources, doc_id: str) -> tuple[str, dict]:
     return res.all_docs[idx], res.all_metadatas[idx]
 
 
+def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
+    """
+    Given candidates already sorted best-first by rerank_score, decides how
+    many are actually relevant to this particular query -- 1, 2, or several,
+    never a fixed count.
+
+    Rather than a hand-picked absolute score cutoff (whose right value
+    depends on this reranker's raw logit scale, which we can't calibrate
+    offline), this looks at the shape of THIS query's own score list: it
+    walks down the sorted scores and stops at the first "cliff" -- a
+    drop-off between consecutive chunks that's large compared to the rest of
+    the gaps in this list. Everything above the cliff is kept; everything
+    below it is cut. A single standout match returns alone. Several
+    similarly-strong matches (no real cliff between them) all survive
+    together, up to max_n.
+    """
+    pool = candidates[: max(max_n, 10)]
+    if len(pool) <= 1:
+        return pool
+
+    scores = [c["rerank_score"] for c in pool]
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    avg_gap = sum(gaps) / len(gaps)
+    score_range = scores[0] - scores[-1]
+
+    cutoff = len(pool)  # no real cliff found in the pool -- keep it all
+    for i, gap in enumerate(gaps):
+        # A gap only counts as a genuine cliff if it's both clearly bigger
+        # than the "background noise" between otherwise-similar chunks in
+        # THIS list, and a meaningful chunk of this list's total spread --
+        # so a list where every score is nearly identical (all similarly
+        # on- or off-topic) doesn't get chopped on tiny noise.
+        is_cliff = gap > avg_gap * 1.6 and (score_range == 0 or gap > 0.12 * score_range)
+        if is_cliff:
+            cutoff = i + 1
+            break
+
+    return pool[:cutoff]
+
+
 def retrieve(res: RagResources, query: str) -> list[dict]:
     dense_ids = _dense_search(res, query, DENSE_TOP_K)
     bm25_ids = _bm25_search(res, query, BM25_TOP_K)
@@ -190,17 +223,8 @@ def retrieve(res: RagResources, query: str) -> list[dict]:
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    top_score = candidates[0]["rerank_score"]
-    relevant = [
-        c for c in candidates
-        if c["rerank_score"] > RERANK_SCORE_THRESHOLD
-        and c["rerank_score"] >= top_score - RERANK_RELATIVE_MARGIN
-    ]
+    relevant = _select_relevant(candidates, FINAL_TOP_N)
     if not relevant:
-        # Nothing cleared the relevance bar. Rather than showing zero sources
-        # for a question that at least fused/retrieved *something*, fall back
-        # to the single best candidate -- but the caller/UI should treat a
-        # one-chunk, sub-threshold answer as low-confidence.
         relevant = candidates[:1]
 
     return relevant[:FINAL_TOP_N]
