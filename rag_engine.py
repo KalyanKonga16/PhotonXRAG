@@ -34,7 +34,16 @@ LLM_MODEL_NAME = "llama-3.3-70b-versatile"  # Groq's free tier model with genero
 DENSE_TOP_K = 20
 BM25_TOP_K = 20
 RRF_K = 60           # reciprocal rank fusion constant
-FINAL_TOP_N = 6       # chunks actually sent to the LLM after reranking
+FINAL_TOP_N = 6       # hard ceiling -- upper bound on chunks sent to the LLM
+
+# bge-reranker-base outputs a raw relevance logit per (query, chunk) pair, not
+# a 0-1 probability. In practice, positive scores are a genuine topical match
+# and scores near/below zero are the reranker saying "not really about this".
+# We use that as a relevance floor so the number of sources reflects how much
+# the index actually has to say about the question -- 1-2 chunks for a narrow
+# question, up to FINAL_TOP_N for one with broad, well-covered context --
+# instead of always padding out to a fixed count.
+RERANK_SCORE_THRESHOLD = 0.0
 
 # How many fused candidates get handed to the (more expensive) cross-encoder
 # reranker. This used to be max(DENSE_TOP_K, BM25_TOP_K) = 15, which silently
@@ -172,7 +181,16 @@ def retrieve(res: RagResources, query: str) -> list[dict]:
         c["rerank_score"] = float(score)
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
-    return candidates[:FINAL_TOP_N]
+
+    relevant = [c for c in candidates if c["rerank_score"] > RERANK_SCORE_THRESHOLD]
+    if not relevant:
+        # Nothing cleared the relevance bar. Rather than showing zero sources
+        # for a question that at least fused/retrieved *something*, fall back
+        # to the single best candidate -- but the caller/UI should treat a
+        # one-chunk, sub-threshold answer as low-confidence.
+        relevant = candidates[:1]
+
+    return relevant[:FINAL_TOP_N]
 
 
 # ---------------------------------------------------------------------------

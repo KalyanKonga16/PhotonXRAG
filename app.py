@@ -3,12 +3,18 @@ PhotonX Copilot - Streamlit Interface
 A polished, chat-first landing experience over the hybrid RAG engine in rag_engine.py.
 """
 
+import base64
+from pathlib import Path
+
 import streamlit as st
 from rag_engine import load_resources, ask
 
+LOGO_PATH = Path(__file__).parent / "assets" / "photonx-logo.png"
+LOGO_B64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
+
 st.set_page_config(
     page_title="PhotonX Copilot",
-    page_icon="\u2726",
+    page_icon=str(LOGO_PATH),
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -49,11 +55,13 @@ st.markdown(
     .hero-mark {
         display: inline-flex; align-items: center; justify-content: center;
         width: 52px; height: 52px; border-radius: 14px;
-        background: linear-gradient(135deg, var(--accent-amber), var(--accent-cyan));
+        background: var(--bg-panel);
         box-shadow: 0 0 32px rgba(242,169,59,0.35);
-        font-size: 24px; margin-bottom: 14px;
+        margin-bottom: 14px;
+        overflow: hidden;
         animation: pulse-glow 3.5s ease-in-out infinite;
     }
+    .hero-mark img { width: 100%; height: 100%; object-fit: cover; display: block; }
     @keyframes pulse-glow {
         0%, 100% { box-shadow: 0 0 24px rgba(242,169,59,0.30); }
         50% { box-shadow: 0 0 40px rgba(77,216,232,0.35); }
@@ -99,14 +107,15 @@ st.markdown(
         to { opacity: 1; transform: translateY(0); }
     }
 
-    /* Source chips */
-    .source-chip {
-        display: inline-block; font-family: 'JetBrains Mono', monospace;
-        font-size: 0.72rem; color: var(--accent-cyan);
-        background: rgba(77,216,232,0.08);
-        border: 1px solid rgba(77,216,232,0.25);
-        border-radius: 6px; padding: 3px 8px; margin: 3px 6px 0 0;
+    /* Sources -- plain reference text, deliberately NOT styled like buttons
+       or links, since these are chunks pulled from an internal .docx and
+       aren't clickable destinations. */
+    .sources-line {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.74rem; color: var(--text-muted);
+        margin-top: 8px; line-height: 1.6;
     }
+    .sources-line .sep { color: var(--border); margin: 0 8px; }
     .sources-label {
         color: var(--text-muted); font-size: 0.72rem;
         text-transform: uppercase; letter-spacing: 0.06em; margin-top: 10px; display: block;
@@ -162,9 +171,9 @@ def queue_question(q: str):
 # ---------------------------------------------------------------------------
 if not st.session_state.messages:
     st.markdown(
-        """
+        f"""
         <div class="hero-wrap">
-            <div class="hero-mark">\u2726</div>
+            <div class="hero-mark"><img src="data:image/png;base64,{LOGO_B64}" alt="PhotonX" /></div>
             <p class="hero-title">PhotonX Copilot</p>
             <p class="hero-sub">Ask anything about our services, projects, or how we work \u2014 answered straight from the source.</p>
         </div>
@@ -186,15 +195,15 @@ if not st.session_state.messages:
 # Render existing conversation
 # ---------------------------------------------------------------------------
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"], avatar="✨" if msg["role"] == "assistant" else None):
+    avatar = str(LOGO_PATH) if msg["role"] == "assistant" else None
+    with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
         if msg.get("sources"):
             st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-            chips = "".join(
-                f'<span class="source-chip">{s["label"][:60]}</span>'
-                for s in msg["sources"]
+            line = '<span class="sep">·</span>'.join(
+                f'<span>{s["label"][:60]}</span>' for s in msg["sources"]
             )
-            st.markdown(chips, unsafe_allow_html=True)
+            st.markdown(f'<div class="sources-line">{line}</div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Input (typed or from a suggestion click)
@@ -208,7 +217,7 @@ if query:
     with st.chat_message("user"):
         st.markdown(query)
 
-    with st.chat_message("assistant", avatar="✨"):
+    with st.chat_message("assistant", avatar=str(LOGO_PATH)):
         try:
             resources = get_resources()
             chunks, stream = ask(resources, query, st.session_state.messages[:-1])
@@ -228,11 +237,10 @@ if query:
 
             if sources:
                 st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-                chips = "".join(
-                    f'<span class="source-chip">{s["label"][:60]}</span>'
-                    for s in sources
+                line = '<span class="sep">·</span>'.join(
+                    f'<span>{s["label"][:60]}</span>' for s in sources
                 )
-                st.markdown(chips, unsafe_allow_html=True)
+                st.markdown(f'<div class="sources-line">{line}</div>', unsafe_allow_html=True)
 
             st.session_state.messages.append(
                 {"role": "assistant", "content": full_answer, "sources": sources}
