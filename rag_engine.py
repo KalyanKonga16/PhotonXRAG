@@ -37,13 +37,21 @@ RRF_K = 60           # reciprocal rank fusion constant
 FINAL_TOP_N = 6       # hard ceiling -- upper bound on chunks sent to the LLM
 
 # bge-reranker-base outputs a raw relevance logit per (query, chunk) pair, not
-# a 0-1 probability. In practice, positive scores are a genuine topical match
-# and scores near/below zero are the reranker saying "not really about this".
-# We use that as a relevance floor so the number of sources reflects how much
-# the index actually has to say about the question -- 1-2 chunks for a narrow
-# question, up to FINAL_TOP_N for one with broad, well-covered context --
-# instead of always padding out to a fixed count.
-RERANK_SCORE_THRESHOLD = 0.0
+# a 0-1 probability, and on a small single-document corpus like this one, an
+# absolute floor alone isn't enough: nearly every chunk shares enough
+# company-wide vocabulary ("PhotonX", "AI", "digital") to score mildly
+# positive even when it isn't actually about the question asked. So a chunk
+# has to clear BOTH of these:
+#   1. RERANK_SCORE_THRESHOLD -- a floor in absolute terms (not just barely
+#      non-negative)
+#   2. RERANK_RELATIVE_MARGIN -- close enough to this query's *best* match,
+#      not just positive in isolation. A chunk that's 5+ points behind the
+#      top hit is a weak tag-along, however positive its raw score is.
+# These two numbers are the knob to turn if results feel too strict/loose --
+# try a few real questions, and tighten (lower the margin) or loosen (raise
+# it) based on whether unrelated sections are still slipping through.
+RERANK_SCORE_THRESHOLD = 1.5
+RERANK_RELATIVE_MARGIN = 3.0
 
 # How many fused candidates get handed to the (more expensive) cross-encoder
 # reranker. This used to be max(DENSE_TOP_K, BM25_TOP_K) = 15, which silently
@@ -182,7 +190,12 @@ def retrieve(res: RagResources, query: str) -> list[dict]:
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    relevant = [c for c in candidates if c["rerank_score"] > RERANK_SCORE_THRESHOLD]
+    top_score = candidates[0]["rerank_score"]
+    relevant = [
+        c for c in candidates
+        if c["rerank_score"] > RERANK_SCORE_THRESHOLD
+        and c["rerank_score"] >= top_score - RERANK_RELATIVE_MARGIN
+    ]
     if not relevant:
         # Nothing cleared the relevance bar. Rather than showing zero sources
         # for a question that at least fused/retrieved *something*, fall back
