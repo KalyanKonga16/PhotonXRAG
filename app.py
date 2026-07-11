@@ -4,6 +4,7 @@ A polished, chat-first landing experience over the hybrid RAG engine in rag_engi
 """
 
 import base64
+import html
 from pathlib import Path
 
 import streamlit as st
@@ -107,18 +108,32 @@ st.markdown(
         to { opacity: 1; transform: translateY(0); }
     }
 
-    /* Sources -- plain reference text, deliberately NOT styled like buttons
-       or links, since these are chunks pulled from an internal .docx and
-       aren't clickable destinations. */
-    .sources-line {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.74rem; color: var(--text-muted);
-        margin-top: 8px; line-height: 1.6;
+    /* Sources -- a single collapsed expander instead of a row of dead-end
+       chips. Opening it shows the actual excerpt each answer was pulled
+       from, which is the practical version of "click through to that part
+       of the document" given the source is a local .docx with no hosted
+       page to deep-link to. */
+    div[data-testid="stExpander"] {
+        border: 1px solid var(--border) !important;
+        border-radius: 10px !important;
+        background: var(--bg-panel) !important;
+        margin-top: 10px !important;
     }
-    .sources-line .sep { color: var(--border); margin: 0 8px; }
-    .sources-label {
-        color: var(--text-muted); font-size: 0.72rem;
-        text-transform: uppercase; letter-spacing: 0.06em; margin-top: 10px; display: block;
+    div[data-testid="stExpander"] summary {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.76rem !important;
+        color: var(--text-muted) !important;
+    }
+    .source-entry { margin-bottom: 10px; }
+    .source-entry:last-child { margin-bottom: 0; }
+    .source-heading {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.76rem; color: var(--accent-cyan);
+        display: block; margin-bottom: 3px;
+    }
+    .source-excerpt {
+        font-size: 0.85rem; color: var(--text-muted);
+        line-height: 1.5; margin: 0;
     }
 
     div[data-testid="stChatInput"] textarea { font-family: 'Inter', sans-serif !important; }
@@ -166,6 +181,27 @@ def queue_question(q: str):
     st.session_state.pending_query = q
 
 
+def render_sources(sources: list[dict]):
+    """One collapsed expander; opening it shows the excerpt each source
+    contributed, so clicking actually surfaces the relevant document
+    content instead of linking nowhere."""
+    if not sources:
+        return
+    label = "Source" if len(sources) == 1 else "Sources"
+    with st.expander(f"{label} ({len(sources)})"):
+        parts = []
+        for s in sources:
+            heading = html.escape(s["label"][:80])
+            excerpt = html.escape(s["excerpt"])
+            parts.append(
+                f'<div class="source-entry">'
+                f'<span class="source-heading">{heading}</span>'
+                f'<p class="source-excerpt">{excerpt}</p>'
+                f"</div>"
+            )
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Hero (only before the first message)
 # ---------------------------------------------------------------------------
@@ -198,12 +234,7 @@ for msg in st.session_state.messages:
     avatar = str(LOGO_PATH) if msg["role"] == "assistant" else None
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
-        if msg.get("sources"):
-            st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-            line = '<span class="sep">·</span>'.join(
-                f'<span>{s["label"][:60]}</span>' for s in msg["sources"]
-            )
-            st.markdown(f'<div class="sources-line">{line}</div>', unsafe_allow_html=True)
+        render_sources(msg.get("sources", []))
 
 # ---------------------------------------------------------------------------
 # Input (typed or from a suggestion click)
@@ -233,14 +264,12 @@ if query:
                     label = meta.get("title", "Document")
                     if heading:
                         label += f" — {heading}"
-                    sources.append({"label": label})
+                    excerpt = c["text"].strip().replace("\n", " ")
+                    if len(excerpt) > 280:
+                        excerpt = excerpt[:280].rsplit(" ", 1)[0] + "…"
+                    sources.append({"label": label, "excerpt": excerpt})
 
-            if sources:
-                st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-                line = '<span class="sep">·</span>'.join(
-                    f'<span>{s["label"][:60]}</span>' for s in sources
-                )
-                st.markdown(f'<div class="sources-line">{line}</div>', unsafe_allow_html=True)
+            render_sources(sources)
 
             st.session_state.messages.append(
                 {"role": "assistant", "content": full_answer, "sources": sources}
