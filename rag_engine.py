@@ -26,7 +26,7 @@ DB_DIR = "./chroma_db"
 COLLECTION_NAME = "photonxtech"
 
 EMBED_MODEL_NAME = "BAAI/bge-base-en-v1.5"
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-large"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
 # Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml)
 LLM_MODEL_NAME = "llama-3.3-70b-versatile"  # Groq's free tier model with generous limits
@@ -163,7 +163,11 @@ def _id_to_doc(res: RagResources, doc_id: str) -> tuple[str, dict]:
     return res.all_docs[idx], res.all_metadatas[idx]
 
 
-def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
+MIN_RELEVANT = 3  # never return fewer than this many, if the pool has them --
+                   # see _select_relevant for why
+
+
+def _select_relevant(candidates: list[dict], max_n: int, min_n: int = MIN_RELEVANT) -> list[dict]:
     """
     Given candidates already sorted best-first by rerank_score, decides how
     many are actually relevant to this particular query -- 1, 2, or several,
@@ -178,6 +182,17 @@ def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
     below it is cut. A single standout match returns alone. Several
     similarly-strong matches (no real cliff between them) all survive
     together, up to max_n.
+
+    On a small corpus (tens of chunks, like this one), a single misranked
+    top chunk -- e.g. a client testimonial that happens to share surface
+    wording with the query -- can create an artificial cliff right after
+    rank 1, discarding every other candidate including the one that's
+    actually correct. min_n is a safety floor: even when a cliff is
+    detected very early, at least min_n candidates (if the pool has that
+    many) still reach the LLM, which can read full context and discount an
+    irrelevant one itself -- cheap insurance on a small corpus where extra
+    context costs little, versus the alternative of retrieval silently
+    deciding the correct chunk doesn't exist.
     """
     pool = candidates[: max(max_n, 10)]
     if len(pool) <= 1:
@@ -200,6 +215,7 @@ def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
             cutoff = i + 1
             break
 
+    cutoff = max(cutoff, min(min_n, len(pool)))
     return pool[:cutoff]
 
 
