@@ -161,8 +161,12 @@ def content_hash(text: str) -> str:
 # Chunking (same header-aware approach used for the website content before)
 # ---------------------------------------------------------------------------
 
-# Matches an attribution line like "— Jane Doe, CEO, Acme Inc"
-_ATTRIBUTION_RE = re.compile(r"^[—\-]\s*.+")
+# Matches a testimonial-style attribution line, e.g. "— Jane Doe, CEO, Acme
+# Inc". Deliberately only the em dash ("—"), not a plain hyphen ("-") --
+# docx_to_markdown renders bulleted list items (like Leadership Team
+# entries) with a leading "- " markdown bullet, which would otherwise
+# false-match this pattern and get mistaken for attributed quotes.
+_ATTRIBUTION_RE = re.compile(r"^—\s*.+")
 
 
 def _split_attributed_quotes(section_text: str) -> list[str] | None:
@@ -210,7 +214,23 @@ def _split_attributed_quotes(section_text: str) -> list[str] | None:
         quotes.append("\n\n".join(pending))
 
     if heading:
-        return [f"{heading}\n\n{q}" for q in quotes]
+        quotes = [f"{heading}\n\n{q}" for q in quotes]
+
+    # These chunks are external voices *about* PhotonX (testimonials,
+    # case-study pull-quotes) -- not statements from PhotonX itself. Left
+    # as bare text, a line like "— Dr. X, CEO, Other Company" reads to an
+    # embedder/reranker as a strong, clean "name + role" signal, which can
+    # outrank PhotonX's own (differently-formatted) Leadership Team chunk
+    # on queries like "who's the CEO" even though it names a client's
+    # CEO, not PhotonX's. Prepending an explicit context line resolves
+    # the ambiguity at the source, for every such query, rather than
+    # trying to out-rank the confusion after the fact.
+    quotes = [
+        "Third-party client testimonial about PhotonX (this quotes an "
+        "external client's own name/title, not a PhotonX employee):\n\n" + q
+        for q in quotes
+    ]
+
     return quotes
 
 
