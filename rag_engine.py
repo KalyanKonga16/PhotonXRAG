@@ -26,7 +26,7 @@ DB_DIR = "./chroma_db"
 COLLECTION_NAME = "photonxtech"
 
 EMBED_MODEL_NAME = "BAAI/bge-base-en-v1.5"
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-large"
 
 # Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml)
 LLM_MODEL_NAME = "llama-3.3-70b-versatile"  # Groq's free tier model with generous limits
