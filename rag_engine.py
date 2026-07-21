@@ -34,7 +34,17 @@ LLM_MODEL_NAME = "llama-3.3-70b-versatile"  # Groq's free tier model with genero
 DENSE_TOP_K = 20
 BM25_TOP_K = 20
 RRF_K = 60           # reciprocal rank fusion constant
-FINAL_TOP_N = 6       # chunks actually sent to the LLM after reranking
+FINAL_TOP_N = 6       # hard ceiling -- upper bound on chunks sent to the LLM
+
+# We don't have a reliable way to hand-pick an absolute reranker-score
+# threshold offline (its raw logit scale isn't something we can calibrate
+# without seeing real score distributions from this corpus), and two
+# attempts at fixed numbers proved it either way: too loose let unrelated
+# sections through, too strict collapsed every query down to one source.
+# Instead, _select_relevant() below looks at each query's own ranked score
+# list and cuts at the first real "cliff" -- a drop-off that's large
+# relative to that query's own spread of scores -- rather than a fixed
+# number tuned to a scale we can't see. See that function for how.
 
 # How many fused candidates get handed to the (more expensive) cross-encoder
 # reranker. This used to be max(DENSE_TOP_K, BM25_TOP_K) = 15, which silently
@@ -153,6 +163,46 @@ def _id_to_doc(res: RagResources, doc_id: str) -> tuple[str, dict]:
     return res.all_docs[idx], res.all_metadatas[idx]
 
 
+def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
+    """
+    Given candidates already sorted best-first by rerank_score, decides how
+    many are actually relevant to this particular query -- 1, 2, or several,
+    never a fixed count.
+
+    Rather than a hand-picked absolute score cutoff (whose right value
+    depends on this reranker's raw logit scale, which we can't calibrate
+    offline), this looks at the shape of THIS query's own score list: it
+    walks down the sorted scores and stops at the first "cliff" -- a
+    drop-off between consecutive chunks that's large compared to the rest of
+    the gaps in this list. Everything above the cliff is kept; everything
+    below it is cut. A single standout match returns alone. Several
+    similarly-strong matches (no real cliff between them) all survive
+    together, up to max_n.
+    """
+    pool = candidates[: max(max_n, 10)]
+    if len(pool) <= 1:
+        return pool
+
+    scores = [c["rerank_score"] for c in pool]
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    avg_gap = sum(gaps) / len(gaps)
+    score_range = scores[0] - scores[-1]
+
+    cutoff = len(pool)  # no real cliff found in the pool -- keep it all
+    for i, gap in enumerate(gaps):
+        # A gap only counts as a genuine cliff if it's both clearly bigger
+        # than the "background noise" between otherwise-similar chunks in
+        # THIS list, and a meaningful chunk of this list's total spread --
+        # so a list where every score is nearly identical (all similarly
+        # on- or off-topic) doesn't get chopped on tiny noise.
+        is_cliff = gap > avg_gap * 1.6 and (score_range == 0 or gap > 0.12 * score_range)
+        if is_cliff:
+            cutoff = i + 1
+            break
+
+    return pool[:cutoff]
+
+
 def retrieve(res: RagResources, query: str) -> list[dict]:
     dense_ids = _dense_search(res, query, DENSE_TOP_K)
     bm25_ids = _bm25_search(res, query, BM25_TOP_K)
@@ -172,7 +222,12 @@ def retrieve(res: RagResources, query: str) -> list[dict]:
         c["rerank_score"] = float(score)
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
-    return candidates[:FINAL_TOP_N]
+
+    relevant = _select_relevant(candidates, FINAL_TOP_N)
+    if not relevant:
+        relevant = candidates[:1]
+
+    return relevant[:FINAL_TOP_N]
 
 
 # ---------------------------------------------------------------------------

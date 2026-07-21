@@ -3,12 +3,19 @@ PhotonX Copilot - Streamlit Interface
 A polished, chat-first landing experience over the hybrid RAG engine in rag_engine.py.
 """
 
+import base64
+import html
+from pathlib import Path
+
 import streamlit as st
 from rag_engine import load_resources, ask
 
+LOGO_PATH = Path(__file__).parent / "assets" / "photonx-logo.png"
+LOGO_B64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
+
 st.set_page_config(
     page_title="PhotonX Copilot",
-    page_icon="\u2726",
+    page_icon=str(LOGO_PATH),
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -49,11 +56,13 @@ st.markdown(
     .hero-mark {
         display: inline-flex; align-items: center; justify-content: center;
         width: 52px; height: 52px; border-radius: 14px;
-        background: linear-gradient(135deg, var(--accent-amber), var(--accent-cyan));
+        background: var(--bg-panel);
         box-shadow: 0 0 32px rgba(242,169,59,0.35);
-        font-size: 24px; margin-bottom: 14px;
+        margin-bottom: 14px;
+        overflow: hidden;
         animation: pulse-glow 3.5s ease-in-out infinite;
     }
+    .hero-mark img { width: 100%; height: 100%; object-fit: cover; display: block; }
     @keyframes pulse-glow {
         0%, 100% { box-shadow: 0 0 24px rgba(242,169,59,0.30); }
         50% { box-shadow: 0 0 40px rgba(77,216,232,0.35); }
@@ -99,17 +108,32 @@ st.markdown(
         to { opacity: 1; transform: translateY(0); }
     }
 
-    /* Source chips */
-    .source-chip {
-        display: inline-block; font-family: 'JetBrains Mono', monospace;
-        font-size: 0.72rem; color: var(--accent-cyan);
-        background: rgba(77,216,232,0.08);
-        border: 1px solid rgba(77,216,232,0.25);
-        border-radius: 6px; padding: 3px 8px; margin: 3px 6px 0 0;
+    /* Sources -- a single collapsed expander instead of a row of dead-end
+       chips. Opening it shows the actual excerpt each answer was pulled
+       from, which is the practical version of "click through to that part
+       of the document" given the source is a local .docx with no hosted
+       page to deep-link to. */
+    div[data-testid="stExpander"] {
+        border: 1px solid var(--border) !important;
+        border-radius: 10px !important;
+        background: var(--bg-panel) !important;
+        margin-top: 10px !important;
     }
-    .sources-label {
-        color: var(--text-muted); font-size: 0.72rem;
-        text-transform: uppercase; letter-spacing: 0.06em; margin-top: 10px; display: block;
+    div[data-testid="stExpander"] summary {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.76rem !important;
+        color: var(--text-muted) !important;
+    }
+    .source-entry { margin-bottom: 10px; }
+    .source-entry:last-child { margin-bottom: 0; }
+    .source-heading {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.76rem; color: var(--accent-cyan);
+        display: block; margin-bottom: 3px;
+    }
+    .source-excerpt {
+        font-size: 0.85rem; color: var(--text-muted);
+        line-height: 1.5; margin: 0;
     }
 
     div[data-testid="stChatInput"] textarea { font-family: 'Inter', sans-serif !important; }
@@ -130,7 +154,18 @@ SUGGESTED_QUESTIONS = [
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Warming up the copilot...")
 def get_resources():
-    return load_resources()
+    try:
+        return load_resources()
+    except RuntimeError:
+        # First run on a fresh deploy (Streamlit Cloud, HF Spaces, etc.) -- the
+        # container has the repo's source_docs/ but no chroma_db/ yet, since
+        # that's generated output, not something we commit. Build it once,
+        # here, instead of requiring a manual `python ingest.py` step that's
+        # easy to forget after every redeploy.
+        import ingest
+        with st.spinner("First run on this deployment: indexing PhotonX documents..."):
+            ingest.run(source_dir=ingest.SOURCE_DIR)
+        return load_resources()
 
 
 # ---------------------------------------------------------------------------
@@ -146,14 +181,35 @@ def queue_question(q: str):
     st.session_state.pending_query = q
 
 
+def render_sources(sources: list[dict]):
+    """One collapsed expander; opening it shows the excerpt each source
+    contributed, so clicking actually surfaces the relevant document
+    content instead of linking nowhere."""
+    if not sources:
+        return
+    label = "Source" if len(sources) == 1 else "Sources"
+    with st.expander(f"{label} ({len(sources)})"):
+        parts = []
+        for s in sources:
+            heading = html.escape(s["label"][:80])
+            excerpt = html.escape(s["excerpt"])
+            parts.append(
+                f'<div class="source-entry">'
+                f'<span class="source-heading">{heading}</span>'
+                f'<p class="source-excerpt">{excerpt}</p>'
+                f"</div>"
+            )
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Hero (only before the first message)
 # ---------------------------------------------------------------------------
 if not st.session_state.messages:
     st.markdown(
-        """
+        f"""
         <div class="hero-wrap">
-            <div class="hero-mark">\u2726</div>
+            <div class="hero-mark"><img src="data:image/png;base64,{LOGO_B64}" alt="PhotonX" /></div>
             <p class="hero-title">PhotonX Copilot</p>
             <p class="hero-sub">Ask anything about our services, projects, or how we work \u2014 answered straight from the source.</p>
         </div>
@@ -175,15 +231,10 @@ if not st.session_state.messages:
 # Render existing conversation
 # ---------------------------------------------------------------------------
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"], avatar="✨" if msg["role"] == "assistant" else None):
+    avatar = str(LOGO_PATH) if msg["role"] == "assistant" else None
+    with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
-        if msg.get("sources"):
-            st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-            chips = "".join(
-                f'<span class="source-chip">{s["label"][:60]}</span>'
-                for s in msg["sources"]
-            )
-            st.markdown(chips, unsafe_allow_html=True)
+        render_sources(msg.get("sources", []))
 
 # ---------------------------------------------------------------------------
 # Input (typed or from a suggestion click)
@@ -197,7 +248,7 @@ if query:
     with st.chat_message("user"):
         st.markdown(query)
 
-    with st.chat_message("assistant", avatar="✨"):
+    with st.chat_message("assistant", avatar=str(LOGO_PATH)):
         try:
             resources = get_resources()
             chunks, stream = ask(resources, query, st.session_state.messages[:-1])
@@ -213,15 +264,12 @@ if query:
                     label = meta.get("title", "Document")
                     if heading:
                         label += f" — {heading}"
-                    sources.append({"label": label})
+                    excerpt = c["text"].strip().replace("\n", " ")
+                    if len(excerpt) > 280:
+                        excerpt = excerpt[:280].rsplit(" ", 1)[0] + "…"
+                    sources.append({"label": label, "excerpt": excerpt})
 
-            if sources:
-                st.markdown('<span class="sources-label">Sources</span>', unsafe_allow_html=True)
-                chips = "".join(
-                    f'<span class="source-chip">{s["label"][:60]}</span>'
-                    for s in sources
-                )
-                st.markdown(chips, unsafe_allow_html=True)
+            render_sources(sources)
 
             st.session_state.messages.append(
                 {"role": "assistant", "content": full_answer, "sources": sources}
