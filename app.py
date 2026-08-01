@@ -5,6 +5,7 @@ A polished, chat-first landing experience over the hybrid RAG engine in rag_engi
 
 import base64
 import html
+import json
 from pathlib import Path
 
 import streamlit as st
@@ -137,6 +138,37 @@ st.markdown(
     }
 
     div[data-testid="stChatInput"] textarea { font-family: 'Inter', sans-serif !important; }
+
+    /* RAGAS scores. Rendered from ragas_live_summary.json, which CI commits
+       after each live eval run -- the app never computes these itself. */
+    .eval-row {
+        display: grid; grid-template-columns: 1fr auto;
+        gap: 3px 10px; margin-bottom: 13px;
+    }
+    .eval-label { font-size: 0.82rem; color: var(--text-primary); }
+    .eval-label .eval-dir {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem; color: var(--text-muted); margin-left: 6px;
+    }
+    .eval-score {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.82rem; color: var(--accent-amber);
+    }
+    .eval-bar {
+        grid-column: 1 / -1; height: 4px; border-radius: 2px;
+        background: var(--border); overflow: hidden;
+    }
+    .eval-bar-fill {
+        height: 100%; border-radius: 2px;
+        background: linear-gradient(90deg, var(--accent-cyan), var(--accent-amber));
+    }
+    .eval-foot {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem; color: var(--text-muted); line-height: 1.7;
+        margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--border);
+    }
+    .eval-foot a { color: var(--accent-cyan); text-decoration: none; }
+    .eval-foot a:hover { text-decoration: underline; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -203,6 +235,68 @@ def render_sources(sources: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# RAGAS evaluation report
+# ---------------------------------------------------------------------------
+EVAL_SUMMARY_PATH = Path(__file__).parent / "ragas_live_summary.json"
+
+
+@st.cache_data(show_spinner=False)
+def load_eval_summary():
+    """Scores from the last .github/workflows/ragas-live.yml run, which drives
+    this deployment with Playwright and commits the result back.
+
+    Deliberately read from a file rather than computed here: ragas + datasets
+    + torch is ~2GB against Streamlit Cloud's ~1GB container, and scoring one
+    question costs 6 judge-LLM calls."""
+    try:
+        with open(EVAL_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def render_evaluation():
+    """No-ops until CI has committed a summary, so a fresh clone or a
+    pre-first-run deploy just doesn't show the section."""
+    summary = load_eval_summary()
+    if not summary:
+        return
+    metrics = [m for m in summary.get("metrics", []) if m.get("score") is not None]
+    if not metrics:
+        return
+
+    n = summary.get("n_questions", 0)
+    with st.expander(f"How accurate is this? — RAGAS scores ({n} eval questions)"):
+        parts = []
+        for m in metrics:
+            score = float(m["score"])
+            # Every metric here is 0-1; clamp anyway so a NaN-ish or
+            # out-of-range value can't blow the bar past its track.
+            pct = max(0.0, min(1.0, score)) * 100
+            direction = "lower is better" if m.get("direction") == "lower" else "higher is better"
+            parts.append(
+                f'<div class="eval-row">'
+                f'<span class="eval-label">{html.escape(str(m["label"]))}'
+                f'<span class="eval-dir">{direction}</span></span>'
+                f'<span class="eval-score">{score:.3f}</span>'
+                f'<div class="eval-bar"><div class="eval-bar-fill" style="width:{pct:.1f}%"></div></div>'
+                f"</div>"
+            )
+
+        foot = [
+            f'Measured against the live deployment on '
+            f'{html.escape(str(summary.get("generated_at", "?")))}',
+            f'Judge LLM: {html.escape(str(summary.get("judge_model", "?")))}',
+        ]
+        run_url = summary.get("run_url")
+        if run_url:
+            foot.append(f'<a href="{html.escape(str(run_url))}" target="_blank">View the CI run ↗</a>')
+        parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
+
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
 # Hero (only before the first message)
 # ---------------------------------------------------------------------------
 if not st.session_state.messages:
@@ -226,6 +320,8 @@ if not st.session_state.messages:
                 on_click=queue_question,
                 args=(question,),
             )
+
+    render_evaluation()
 
 # ---------------------------------------------------------------------------
 # Render existing conversation
