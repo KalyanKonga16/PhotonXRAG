@@ -1,1 +1,226 @@
-dfsdf
+# Repo path: .github/workflows/ragas-live.yml
+name: RAGAS (live deployment)
+
+on:
+  workflow_dispatch:
+    inputs:
+      eval_dataset:
+        description: "Eval dataset JSON to run"
+        required: false
+        default: "eval_dataset.json"
+      live_url:
+        description: "Deployment to test"
+        required: false
+        default: "https://photonxrag.streamlit.app/"
+      judge_model:
+        description: "Groq model used as the RAGAS judge LLM"
+        required: false
+        default: "openai/gpt-oss-120b"
+      commit_results:
+        description: "Commit results back to the repo (so app.py can render them)"
+        type: boolean
+        required: false
+        default: true
+
+# Needed only by the "Commit results" step. Drop to `contents: read` if you
+# set commit_results=false and just want the artifact.
+permissions:
+  contents: write
+
+# Two concurrent runs would drive the same Streamlit deployment at once and
+# fight over its single-container session state. Queue them instead.
+concurrency:
+  group: ragas-live
+  cancel-in-progress: false
+
+jobs:
+  ragas-live:
+    name: Run RAGAS
+    runs-on: ubuntu-latest
+    # Cold-starting a sleeping Streamlit app is up to 3 min, then 5 questions
+    # x (browser round trip + 6 judge-LLM metrics). 45 min is generous headroom.
+    timeout-minutes: 45
+
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PHOTONX_LIVE_URL: ${{ inputs.live_url }}
+      RAGAS_LLM_MODEL: ${{ inputs.judge_model }}
+      EVAL_DATASET: ${{ inputs.eval_dataset }}
+      TOKENIZERS_PARALLELISM: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail early if GROQ_API_KEY is missing
+        run: |
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "::error::GROQ_API_KEY is not set. Add it under Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-eval.txt
+
+      - name: Install eval dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-eval.txt
+
+      # BAAI/bge-base-en-v1.5 is ~440MB. Without this every run re-downloads it.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-bge-base-en-v1.5-${{ runner.os }}
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run RAGAS against the live deployment
+        run: |
+          set -o pipefail
+          python ragas_eval_live.py "$EVAL_DATASET" 2>&1 | tee ragas_live_console.log
+
+      # Turns ragas_live_results.csv into (a) the job summary you see in the
+      # Actions tab and (b) ragas_live_summary.json, which app.py renders.
+      - name: Build report
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          from datetime import datetime, timezone
+
+          CSV = pathlib.Path("ragas_live_results.csv")
+          out = []
+
+          def emit(line=""):
+              out.append(line)
+
+          emit("# RAGAS — live deployment")
+          emit()
+          emit(f"**Target:** {os.environ.get('PHOTONX_LIVE_URL', '?')}")
+          emit(f"**Judge LLM:** `{os.environ.get('RAGAS_LLM_MODEL', '?')}`")
+          emit(f"**Dataset:** `{os.environ.get('EVAL_DATASET', '?')}`")
+          emit()
+
+          if not CSV.exists():
+              emit("> The run produced no results CSV — it failed before scoring.")
+              emit("> Check the step log above, or the `ragas-live-results` artifact for `ragas_live_console.log`.")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                  f.write("\n".join(out) + "\n")
+              raise SystemExit(0)
+
+          import pandas as pd
+
+          df = pd.read_csv(CSV)
+
+          # (column in the CSV) -> (display name, which direction is good)
+          DISPLAY = {
+              "faithfulness": ("Faithfulness", "higher"),
+              "answer_relevancy": ("Response Relevancy", "higher"),
+              "llm_context_precision_with_reference": ("Context Precision", "higher"),
+              "context_recall": ("Context Recall", "higher"),
+              "context_entity_recall": ("Context Entities Recall", "higher"),
+              "noise_sensitivity_relevant": ("Noise Sensitivity", "lower"),
+          }
+          # Anything numeric that isn't a known text column counts as a metric,
+          # so a ragas version that renames a column still shows up here.
+          TEXT_COLS = {"question", "user_input", "contexts", "retrieved_contexts",
+                       "answer", "response", "ground_truth", "reference"}
+
+          metric_cols = []
+          for col in df.columns:
+              if col in TEXT_COLS:
+                  continue
+              series = pd.to_numeric(df[col], errors="coerce")
+              if series.notna().any():
+                  metric_cols.append((col, series))
+
+          metrics = []
+          emit("## Aggregate scores")
+          emit()
+          emit("| Metric | Score | Good direction |")
+          emit("| --- | ---: | --- |")
+          for col, series in metric_cols:
+              label, direction = DISPLAY.get(col, (col, "higher"))
+              score = float(series.mean())
+              arrow = "↑ higher" if direction == "higher" else "↓ lower"
+              emit(f"| {label} | {score:.4f} | {arrow} |")
+              metrics.append({"key": col, "label": label,
+                              "direction": direction, "score": round(score, 4)})
+          emit()
+
+          emit(f"## Per-question ({len(df)} scored)")
+          emit()
+          qcol = "user_input" if "user_input" in df.columns else "question"
+          header = "| Question | " + " | ".join(
+              DISPLAY.get(c, (c, ""))[0] for c, _ in metric_cols) + " |"
+          emit(header)
+          emit("| --- |" + " ---: |" * len(metric_cols))
+          for i in range(len(df)):
+              q = str(df[qcol].iloc[i]) if qcol in df.columns else f"#{i + 1}"
+              q = q.replace("|", "\\|")
+              if len(q) > 70:
+                  q = q[:70] + "…"
+              cells = []
+              for _, series in metric_cols:
+                  v = series.iloc[i]
+                  cells.append("—" if pd.isna(v) else f"{float(v):.3f}")
+              emit(f"| {q} | " + " | ".join(cells) + " |")
+          emit()
+          emit("Full per-question detail (answers + retrieved contexts) is in the "
+               "`ragas-live-results` artifact on this run.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+
+          server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+
+          summary = {
+              "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "live_url": os.environ.get("PHOTONX_LIVE_URL"),
+              "judge_model": os.environ.get("RAGAS_LLM_MODEL"),
+              "dataset": os.environ.get("EVAL_DATASET"),
+              "n_questions": int(len(df)),
+              "run_url": f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else None,
+              "metrics": metrics,
+          }
+          with open("ragas_live_summary.json", "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2)
+              f.write("\n")
+          print("Wrote ragas_live_summary.json")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-live-results
+          path: |
+            ragas_live_results.csv
+            ragas_live_summary.json
+            ragas_live_console.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Commits the two result files so the Streamlit deployment redeploys and
+      # app.py's Evaluation expander shows the fresh numbers.
+      - name: Commit results
+        if: ${{ inputs.commit_results && success() }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ragas_live_results.csv ragas_live_summary.json
+          if git diff --staged --quiet; then
+            echo "Results unchanged - nothing to commit."
+          else
+            git commit -m "chore(eval): refresh RAGAS live results [skip ci]"
+            git push
+          fi
