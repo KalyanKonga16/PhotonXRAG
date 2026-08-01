@@ -31,7 +31,7 @@ RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 # Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml)
 # NOTE: Groq deprecated llama-3.3-70b-versatile on 2026-06-17. openai/gpt-oss-120b
 # is Groq's recommended replacement (faster inference, similar quality tier).
-LLM_MODEL_NAME = "openai/gpt-oss-120b"
+LLM_MODEL_NAME = "llama-3.3-70b-versatile"
 
 DENSE_TOP_K = 20
 BM25_TOP_K = 20
