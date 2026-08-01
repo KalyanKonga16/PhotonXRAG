@@ -1,5 +1,6 @@
 """
 PhotonX RAG - Retrieval + Generation Engine
+
 Hybrid retrieval (BM25 + dense) -> Reciprocal Rank Fusion -> Cross-encoder rerank -> Groq Llama generation
 
 Import `ask()` from a Streamlit (or FastAPI, later) app to power the copilot.
@@ -24,17 +25,18 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DB_DIR = "./chroma_db"
 COLLECTION_NAME = "photonxtech"
-
 EMBED_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
 # Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml)
-LLM_MODEL_NAME = "llama-3.3-70b-versatile"  # Groq's free tier model with generous limits
+# NOTE: Groq deprecated llama-3.3-70b-versatile on 2026-06-17. openai/gpt-oss-120b
+# is Groq's recommended replacement (faster inference, similar quality tier).
+LLM_MODEL_NAME = "openai/gpt-oss-120b"
 
 DENSE_TOP_K = 20
 BM25_TOP_K = 20
-RRF_K = 60           # reciprocal rank fusion constant
-FINAL_TOP_N = 6       # hard ceiling -- upper bound on chunks sent to the LLM
+RRF_K = 60  # reciprocal rank fusion constant
+FINAL_TOP_N = 6  # hard ceiling -- upper bound on chunks sent to the LLM
 
 # We don't have a reliable way to hand-pick an absolute reranker-score
 # threshold offline (its raw logit scale isn't something we can calibrate
@@ -74,10 +76,10 @@ service names, project names) from the context rather than speaking generically.
 
 Rules:
 - If the context does not contain the answer, say so plainly and suggest what topic area might
-  help instead. Do not make anything up.
+help instead. Do not make anything up.
 - Keep answers concise and conversational, like a knowledgeable team member, not a wall of text.
 - When relevant, mention which document/section the info came from in plain language (e.g. "in
-  the Services section..."), but don't dump raw filenames into the middle of sentences.
+the Services section..."), but don't dump raw filenames into the middle of sentences.
 """
 
 
@@ -163,11 +165,7 @@ def _id_to_doc(res: RagResources, doc_id: str) -> tuple[str, dict]:
     return res.all_docs[idx], res.all_metadatas[idx]
 
 
-MIN_RELEVANT = 3  # never return fewer than this many, if the pool has them --
-                   # see _select_relevant for why
-
-
-def _select_relevant(candidates: list[dict], max_n: int, min_n: int = MIN_RELEVANT) -> list[dict]:
+def _select_relevant(candidates: list[dict], max_n: int) -> list[dict]:
     """
     Given candidates already sorted best-first by rerank_score, decides how
     many are actually relevant to this particular query -- 1, 2, or several,
@@ -182,17 +180,6 @@ def _select_relevant(candidates: list[dict], max_n: int, min_n: int = MIN_RELEVA
     below it is cut. A single standout match returns alone. Several
     similarly-strong matches (no real cliff between them) all survive
     together, up to max_n.
-
-    On a small corpus (tens of chunks, like this one), a single misranked
-    top chunk -- e.g. a client testimonial that happens to share surface
-    wording with the query -- can create an artificial cliff right after
-    rank 1, discarding every other candidate including the one that's
-    actually correct. min_n is a safety floor: even when a cliff is
-    detected very early, at least min_n candidates (if the pool has that
-    many) still reach the LLM, which can read full context and discount an
-    irrelevant one itself -- cheap insurance on a small corpus where extra
-    context costs little, versus the alternative of retrieval silently
-    deciding the correct chunk doesn't exist.
     """
     pool = candidates[: max(max_n, 10)]
     if len(pool) <= 1:
@@ -215,7 +202,6 @@ def _select_relevant(candidates: list[dict], max_n: int, min_n: int = MIN_RELEVA
             cutoff = i + 1
             break
 
-    cutoff = max(cutoff, min(min_n, len(pool)))
     return pool[:cutoff]
 
 
@@ -274,6 +260,7 @@ def generate_answer_stream(query: str, chunks: list[dict], chat_history: list[di
     client = Groq(api_key=api_key)
 
     context_block = _build_context_block(chunks)
+
     history_text = ""
     for turn in chat_history[-6:]:  # keep last few turns for follow-up context
         role = "User" if turn["role"] == "user" else "Assistant"
@@ -299,6 +286,7 @@ Answer the current question using the context above."""}
         temperature=0.7,
         max_tokens=1024,
     )
+
     for chunk in response:
         if chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
