@@ -58,7 +58,7 @@ DEFAULT_RESULTS_CSV_PATH = "ragas_results.csv"
 
 # Groq deprecated llama-3.3-70b-versatile on 2026-06-17. gpt-oss-120b is the
 # recommended replacement; override with RAGAS_LLM_MODEL if you use something else.
-RAGAS_LLM_MODEL = os.environ.get("RAGAS_LLM_MODEL", "openai/gpt-oss-120b")
+RAGAS_LLM_MODEL = os.environ.get("RAGAS_LLM_MODEL", "llama-3.3-70b-versatile")
 
 # All 6 metrics. Add more later (e.g. if you bring in reference-free variants)
 # by just extending this list - run_evaluation() doesn't care how many there are.
