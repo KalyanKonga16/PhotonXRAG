@@ -169,6 +169,15 @@ st.markdown(
     }
     .eval-foot a { color: var(--accent-cyan); text-decoration: none; }
     .eval-foot a:hover { text-decoration: underline; }
+    .eval-empty { font-size: 0.82rem; color: var(--text-muted); line-height: 1.6; margin: 0; }
+    .eval-empty code {
+        font-family: 'JetBrains Mono', monospace; font-size: 0.76rem;
+        color: var(--accent-cyan); background: rgba(77,216,232,0.08);
+        padding: 1px 5px; border-radius: 4px;
+    }
+    /* Breathing room so the always-on scores panel doesn't crowd the last
+       chat bubble above it. */
+    .eval-anchor { margin-top: 18px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -256,13 +265,27 @@ def load_eval_summary():
 
 
 def render_evaluation():
-    """No-ops until CI has committed a summary, so a fresh clone or a
-    pre-first-run deploy just doesn't show the section."""
+    """Always rendered, at the bottom of the page, so the scores stay reachable
+    at any point in the conversation instead of only on the landing screen.
+
+    Rendered once rather than repeated under each answer on purpose: these are
+    corpus-level aggregates over the eval set, not a score for the answer you
+    just got. Repeating them per-message would read as the latter."""
     summary = load_eval_summary()
-    if not summary:
-        return
-    metrics = [m for m in summary.get("metrics", []) if m.get("score") is not None]
+    metrics = [m for m in (summary or {}).get("metrics", []) if m.get("score") is not None]
+
+    st.markdown('<div class="eval-anchor"></div>', unsafe_allow_html=True)
+
     if not metrics:
+        with st.expander("How accurate is this? — RAGAS evaluation"):
+            st.markdown(
+                '<p class="eval-empty">No evaluation run has been recorded yet. '
+                'Run the <strong>RAGAS (live deployment)</strong> workflow from the '
+                'Actions tab of the repository. It scores this deployment end to end '
+                'and commits <code>ragas_live_summary.json</code>, and the six metric '
+                'scores then appear here automatically.</p>',
+                unsafe_allow_html=True,
+            )
         return
 
     n = summary.get("n_questions", 0)
@@ -321,8 +344,6 @@ if not st.session_state.messages:
                 args=(question,),
             )
 
-    render_evaluation()
-
 # ---------------------------------------------------------------------------
 # Render existing conversation
 # ---------------------------------------------------------------------------
@@ -374,3 +395,10 @@ if query:
             st.error(str(e))
         except Exception as e:
             st.error(f"Something went wrong: {e}")
+
+
+# Last thing on the page, so it sits under the newest answer and is present on
+# every screen -- landing page and mid-conversation alike. st.chat_input is
+# pinned to the viewport bottom by Streamlit regardless of call order, so this
+# does not displace the input box.
+render_evaluation()
