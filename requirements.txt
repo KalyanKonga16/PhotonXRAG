@@ -7,3 +7,13 @@ tiktoken
 rank_bm25
 groq
 streamlit
+
+# --- per-answer RAGAS scoring (live_metrics.py) ---
+# torch/transformers are NOT added by these: sentence-transformers above
+# already pulls them in, and live_metrics.py reuses the embedding model the
+# app has loaded rather than instantiating a second one.
+#
+# ragas brings datasets + langchain-core + pydantic transitively.
+# langchain-groq is the judge-LLM client (ChatGroq).
+ragas
+langchain-groq
