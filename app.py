@@ -10,6 +10,7 @@ from pathlib import Path
 
 import streamlit as st
 from rag_engine import load_resources, ask
+from live_metrics import score_answer
 
 LOGO_PATH = Path(__file__).parent / "assets" / "photonx-logo.png"
 LOGO_B64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
@@ -170,6 +171,26 @@ st.markdown(
     .eval-foot a { color: var(--accent-cyan); text-decoration: none; }
     .eval-foot a:hover { text-decoration: underline; }
     .eval-empty { font-size: 0.82rem; color: var(--text-muted); line-height: 1.6; margin: 0; }
+
+    /* Per-answer scores, rendered under each reply. Deliberately quiet -- a
+       metadata strip, not a second headline competing with the answer. */
+    .score-strip {
+        display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+        margin-top: 9px;
+    }
+    .score-chip {
+        display: inline-flex; align-items: baseline; gap: 6px;
+        border: 1px solid var(--border); border-radius: 999px;
+        background: var(--bg-panel); padding: 3px 11px;
+        font-family: 'JetBrains Mono', monospace; font-size: 0.7rem;
+        color: var(--text-muted);
+    }
+    .score-chip b { font-weight: 500; font-size: 0.76rem; }
+    .score-good b { color: #5FD08A; }
+    .score-mid  b { color: var(--accent-amber); }
+    .score-low  b { color: #E86A6A; }
+    .score-note { font-family: 'JetBrains Mono', monospace;
+                  font-size: 0.68rem; color: var(--text-muted); }
     .eval-empty code {
         font-family: 'JetBrains Mono', monospace; font-size: 0.76rem;
         color: var(--accent-cyan); background: rgba(77,216,232,0.08);
@@ -216,6 +237,18 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
+if "score_answers" not in st.session_state:
+    # On by default; the sidebar toggle is the escape hatch when Groq starts
+    # rate-limiting, since scoring triples the request count per question.
+    st.session_state.score_answers = True
+
+with st.sidebar:
+    st.toggle(
+        "Score every answer",
+        key="score_answers",
+        help="Runs RAGAS Faithfulness and Response Relevancy on each reply. "
+             "Adds a few seconds and 3-4 extra Groq calls per question.",
+    )
 
 
 def queue_question(q: str):
@@ -241,6 +274,40 @@ def render_sources(sources: list[dict]):
                 f"</div>"
             )
         st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def render_answer_scores(scores: dict | None):
+    """The two reference-free RAGAS metrics for one specific answer.
+
+    Separate from render_evaluation(): that one is a corpus-level report card
+    over the fixed eval set, this is about the reply directly above it."""
+    if not scores:
+        return
+    if scores.get("error"):
+        st.markdown(
+            f'<p class="score-note">Answer scoring unavailable: '
+            f'{html.escape(str(scores["error"]))}</p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    chips = []
+    for key, label, floor in (
+        ("faithfulness", "Faithfulness", 0.7),
+        ("answer_relevancy", "Relevancy", 0.7),
+    ):
+        val = scores.get(key)
+        if val is None:
+            continue
+        tone = "score-good" if val >= 0.85 else ("score-mid" if val >= floor else "score-low")
+        chips.append(
+            f'<span class="score-chip {tone}">{label} <b>{val:.2f}</b></span>'
+        )
+    if chips:
+        st.markdown(
+            '<div class="score-strip">' + "".join(chips) + "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +419,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
         render_sources(msg.get("sources", []))
+        render_answer_scores(msg.get("scores"))
 
 # ---------------------------------------------------------------------------
 # Input (typed or from a suggestion click)
@@ -388,8 +456,32 @@ if query:
 
             render_sources(sources)
 
+            # Scored only after the answer is on screen, so the judge calls
+            # (3-4 extra Groq requests) never delay the reply itself. Stored on
+            # the message so Streamlit's reruns replay it instead of re-billing.
+            scores = None
+            if st.session_state.get("score_answers", True) and chunks:
+                with st.spinner("Scoring this answer..."):
+                    result = score_answer(
+                        question=query,
+                        contexts=[c["text"] for c in chunks],
+                        answer=full_answer,
+                        embedder=resources.embedder,
+                    )
+                scores = {
+                    "faithfulness": result.faithfulness,
+                    "answer_relevancy": result.answer_relevancy,
+                    "error": result.error,
+                }
+                render_answer_scores(scores)
+
             st.session_state.messages.append(
-                {"role": "assistant", "content": full_answer, "sources": sources}
+                {
+                    "role": "assistant",
+                    "content": full_answer,
+                    "sources": sources,
+                    "scores": scores,
+                }
             )
         except RuntimeError as e:
             st.error(str(e))
