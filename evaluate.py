@@ -167,6 +167,22 @@ def aggregate(rows: list[dict]) -> list[dict]:
     return out
 
 
+def build_summary(rows: list[dict], dataset_name: str) -> dict:
+    """Assemble the summary object. Shared by this script's CLI and by the
+    in-app "Run evaluation" button in app.py, so the report card renders from
+    an identical shape no matter which one produced it."""
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "dataset": dataset_name,
+        "n_questions": len(rows),
+        "n_scored": sum(1 for r in rows if r["scores"]),
+        "answer_model": LLM_MODEL_NAME,
+        "judge_model": JUDGE_MODEL,
+        "metrics": aggregate(rows),
+        "questions": rows,
+    }
+
+
 def needs_attention(metric: dict) -> bool:
     if metric["score"] is None:
         return False
@@ -250,16 +266,7 @@ def main() -> int:
         if args.sleep and i < len(items):
             time.sleep(args.sleep)
 
-    summary = {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "dataset": args.dataset.name,
-        "n_questions": len(rows),
-        "n_scored": sum(1 for r in rows if r["scores"]),
-        "answer_model": LLM_MODEL_NAME,
-        "judge_model": JUDGE_MODEL,
-        "metrics": aggregate(rows),
-        "questions": rows,
-    }
+    summary = build_summary(rows, args.dataset.name)
 
     print_report(summary)
 

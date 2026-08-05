@@ -183,6 +183,21 @@ reference-free by definition and measured as specified.
 
 ### Whole system — "how good is this RAG pipeline?"
 
+Both paths run the **same** code over the same questions and produce the same
+report card. Pick whichever suits you.
+
+**From the deployed app** — open the sidebar, set how many questions, press
+**Run evaluation**. It answers and scores each question inside the deployment,
+logging progress as it goes, then renders the report card. Roughly 20–40s per
+question.
+
+Results live in your browser session only, and are gone on reboot or for the
+next visitor. To make them the default everyone sees, use the
+**Download eval_summary.json** button under the report card and commit that file.
+
+**From the command line** — writes `eval_summary.json` directly, so it becomes
+the committed baseline:
+
 ```bash
 python evaluate.py                   # full run → writes eval_summary.json
 python evaluate.py --limit 3         # smoke test
@@ -190,10 +205,11 @@ python evaluate.py --sleep 3         # pause between questions (rate limits)
 python evaluate.py --no-write        # print only
 ```
 
-This drives the **real** pipeline over every question in `eval_dataset.json`,
-scores each answer against its known-correct reference, and writes aggregate
-numbers to `eval_summary.json`. The app renders that file as the report card at
-the bottom of the page. Commit it for the deployed app to show the numbers.
+Either way it drives the **real** pipeline over every question in
+`eval_dataset.json` and scores each answer against its known-correct reference.
+Where the run happens does not change what is measured: the same
+`rag_engine.py`, the same committed `chroma_db/`, the same models, the same Groq
+API. `eval_summary.json` is just data.
 
 Having a reference buys three things the live path cannot have:
 
@@ -217,10 +233,12 @@ returns *something*, so that question measures whether the system declines
 instead of answering from the model's own knowledge — Answer Correctness scores
 `0.0` if it confidently answers anyway.
 
-Evaluation runs offline rather than from a button in the app: each question
-costs a retrieval pass, an answer and a judge call, which over a full set is
-minutes of wall-clock and dozens of Groq requests — enough to hit a free-tier
-rate limit and long enough to trip a Streamlit Cloud request timeout.
+**On cost** — each question is one retrieval pass, one answer call and one judge
+call. A full 9-question run is ~27 Groq requests and several minutes. On a free
+tier that can trip the per-minute limit; raise the pause between questions (the
+sidebar input, or `--sleep`) if you see rate-limit errors. Questions that fail
+are reported individually and excluded from the averages rather than counted as
+zero, so one rate-limited question does not read as a regression.
 
 ---
 

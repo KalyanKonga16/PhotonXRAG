@@ -6,11 +6,13 @@ A polished, chat-first landing experience over the hybrid RAG engine in rag_engi
 import base64
 import html
 import json
+import time
 from pathlib import Path
 
 import streamlit as st
 from rag_engine import load_resources, ask
 from llm_metrics import JUDGE_MODEL, METRICS, score_answer
+from evaluate import DEFAULT_DATASET, build_summary, load_dataset, run_one
 
 LOGO_PATH = Path(__file__).parent / "assets" / "photonx-logo.png"
 LOGO_B64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
@@ -303,6 +305,25 @@ if "score_answers" not in st.session_state:
     # rate-limiting, since scoring adds one request per question.
     st.session_state.score_answers = True
 
+if "eval_summary" not in st.session_state:
+    # Holds the result of an in-app evaluation run for this browser session.
+    # None means "nothing run here" -- render_evaluation() then falls back to a
+    # committed eval_summary.json if one exists.
+    st.session_state.eval_summary = None
+if "run_eval" not in st.session_state:
+    st.session_state.run_eval = None
+
+
+@st.cache_data(show_spinner=False)
+def get_eval_questions():
+    """The benchmark set, read once. Cached because the sidebar needs its length
+    on every rerun to bound the question-count input."""
+    try:
+        return load_dataset(DEFAULT_DATASET)
+    except (OSError, SystemExit):
+        return []
+
+
 with st.sidebar:
     st.toggle(
         "Score every answer",
@@ -310,6 +331,47 @@ with st.sidebar:
         help="Scores all six RAGAS metrics on each reply using one extra "
              "judge-LLM call. Adds a couple of seconds per question.",
     )
+
+    st.divider()
+    st.caption("**System evaluation**")
+
+    _questions = get_eval_questions()
+    if not _questions:
+        st.caption(
+            f"`{DEFAULT_DATASET.name}` is missing or unreadable, so there is "
+            "nothing to evaluate against."
+        )
+    else:
+        st.caption(
+            f"Runs the pipeline over {len(_questions)} benchmark questions with "
+            "known-correct answers, right here in the deployment. Roughly 20-40s "
+            "per question."
+        )
+        n_eval = st.number_input(
+            "Questions to run",
+            min_value=1,
+            max_value=len(_questions),
+            value=len(_questions),
+            help="Start with 2 to confirm the wiring before spending a full run.",
+        )
+        pause = st.number_input(
+            "Pause between questions (s)",
+            min_value=0.0,
+            max_value=15.0,
+            value=0.0,
+            step=0.5,
+            help="Raise this if Groq starts returning rate-limit errors. Each "
+                 "question costs one answer call plus one judge call.",
+        )
+        if st.button("Run evaluation", use_container_width=True):
+            # Only record the request here. The run itself happens in the main
+            # body below, where there is room to render progress -- a sidebar
+            # button handler is a poor place to hold a multi-minute loop.
+            st.session_state.run_eval = {"n": int(n_eval), "pause": float(pause)}
+        if st.session_state.eval_summary:
+            if st.button("Clear results", use_container_width=True):
+                st.session_state.eval_summary = None
+                st.rerun()
 
 
 def queue_question(q: str):
@@ -459,7 +521,77 @@ def _read_eval_summary(mtime: float):
 
 
 def load_eval_summary():
-    return _read_eval_summary(_summary_mtime())
+    """An in-app run for this session wins over the committed file: if you just
+    pressed the button, the numbers on screen should be the ones you asked
+    for."""
+    return st.session_state.get("eval_summary") or _read_eval_summary(_summary_mtime())
+
+
+def run_evaluation_in_app(request: dict):
+    """Answer and score the benchmark set inside this deployment.
+
+    Runs in the main script body rather than a background thread on purpose:
+    Streamlit's rerun model gives a thread no safe way to draw, and the script
+    is allowed to run as long as the browser stays connected. The cost is that
+    the page is busy until it finishes, which is why the progress UI reports
+    every question as it lands instead of showing one opaque spinner.
+
+    Returns True if results were stored, so the caller can rerun and let the
+    sidebar redraw with them present.
+    """
+    questions = get_eval_questions()[: request["n"]]
+    if not questions:
+        st.warning("Nothing to evaluate.")
+        return False
+
+    pause = request["pause"]
+    rows = []
+    with st.status(
+        f"Evaluating {len(questions)} questions in this deployment...",
+        expanded=True,
+    ) as status:
+        bar = st.progress(0.0)
+        for i, item in enumerate(questions, 1):
+            st.write(f"**{i}/{len(questions)}** — {item['question']}")
+            try:
+                resources = get_resources()
+            except Exception as e:
+                status.update(label="Evaluation could not start", state="error")
+                st.error(f"Could not load the index: {e}")
+                return False
+            row = run_one(resources, item)
+            rows.append(row)
+
+            if row["error"]:
+                st.write(f"&nbsp;&nbsp;↳ :red[{row['error']}]")
+            else:
+                got = ", ".join(
+                    f"{lbl.split()[-1]} {row['scores'][k]:.2f}"
+                    for k, lbl, _d, _nr in METRICS
+                    if k in row["scores"]
+                )
+                st.write(f"&nbsp;&nbsp;↳ :green[{got}]")
+            bar.progress(i / len(questions))
+
+            if pause and i < len(questions):
+                time.sleep(pause)
+
+        summary = build_summary(rows, DEFAULT_DATASET.name)
+        summary["computed_in_app"] = True
+        st.session_state.eval_summary = summary
+
+        n_failed = sum(1 for r in rows if r["error"])
+        if n_failed == len(rows):
+            status.update(label="Every question failed to score", state="error")
+        elif n_failed:
+            status.update(
+                label=f"Done — {len(rows) - n_failed} of {len(rows)} scored",
+                state="complete",
+            )
+        else:
+            status.update(label=f"Done — all {len(rows)} questions scored", state="complete")
+
+    return True
 
 
 def render_evaluation():
@@ -478,11 +610,15 @@ def render_evaluation():
     if not metrics:
         with st.expander("How good is this RAG system overall? — run the evaluation"):
             st.markdown(
-                '<p class="eval-empty">No evaluation has been recorded yet. Run '
-                '<code>python evaluate.py</code> to answer and score every question '
-                'in <code>eval_dataset.json</code> with the real pipeline. It writes '
-                '<code>eval_summary.json</code>, and the aggregate scores appear here '
-                'automatically once that file is committed.</p>',
+                '<p class="eval-empty">No evaluation has been recorded yet. Open the '
+                'sidebar and press <strong>Run evaluation</strong> to answer and score '
+                f'every question in <code>{html.escape(DEFAULT_DATASET.name)}</code> '
+                'with the real pipeline, right here in this deployment.<br/><br/>'
+                'Results stay in your session. To make them the default every visitor '
+                'sees, download the summary afterwards and commit it as '
+                '<code>eval_summary.json</code> &mdash; or run '
+                '<code>python evaluate.py</code> offline, which writes that file '
+                'directly.</p>',
                 unsafe_allow_html=True,
             )
         return
@@ -512,10 +648,16 @@ def render_evaluation():
                 f"</div>"
             )
 
+        in_app = bool(summary.get("computed_in_app"))
         foot = [
             f'{scored} of {n} questions scored from '
             f'<code>{html.escape(str(summary.get("dataset", "eval_dataset.json")))}</code> '
             f'on {html.escape(str(summary.get("generated_at", "?")))}',
+            # Where the numbers came from is not a detail: a session run is
+            # visible only to you, a committed one is what every visitor sees.
+            'Computed in this deployment just now &mdash; this session only'
+            if in_app
+            else 'Read from the committed <code>eval_summary.json</code>',
             f'Answers: {html.escape(str(summary.get("answer_model", "?")))} '
             f'&middot; Judge: {html.escape(str(summary.get("judge_model", "?")))}',
             'Every question here has a known-correct reference answer, so Context '
@@ -524,6 +666,16 @@ def render_evaluation():
         ]
         parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
         st.markdown("".join(parts), unsafe_allow_html=True)
+
+        if in_app:
+            st.download_button(
+                "Download eval_summary.json",
+                data=json.dumps(summary, indent=2, ensure_ascii=False),
+                file_name="eval_summary.json",
+                mime="application/json",
+                help="Commit this to the repo to make these the numbers every "
+                     "visitor sees, instead of only this session.",
+            )
 
         rows = summary.get("questions") or []
         if rows:
@@ -644,6 +796,20 @@ if query:
         except Exception as e:
             st.error(f"Something went wrong: {e}")
 
+
+# Requested from the sidebar. Handled here, after the chat, so the progress log
+# and the report card it produces appear in reading order at the bottom of the
+# page rather than above the conversation.
+if st.session_state.run_eval:
+    request = st.session_state.run_eval
+    st.session_state.run_eval = None  # cleared first: a rerun mid-run must not restart it
+    if run_evaluation_in_app(request):
+        # The sidebar was already drawn this pass, before any results existed,
+        # so its "Clear results" button would not appear until the user next
+        # interacted with something. Rerun to redraw it. Nothing is lost: the
+        # transient progress log duplicates summary["questions"], which the
+        # report card renders per question, errors included.
+        st.rerun()
 
 # Last thing on the page, so it sits under the newest answer and is present on
 # every screen -- landing page and mid-conversation alike. st.chat_input is
