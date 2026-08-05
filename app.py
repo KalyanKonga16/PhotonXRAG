@@ -5,6 +5,7 @@ A polished, chat-first landing experience over the hybrid RAG engine in rag_engi
 
 import base64
 import html
+import json
 from pathlib import Path
 
 import streamlit as st
@@ -195,6 +196,70 @@ st.markdown(
         font-size: 0.68rem; color: var(--text-muted); line-height: 1.7;
         margin-top: 2px; padding-top: 9px; border-top: 1px solid var(--border);
     }
+
+    /* System-level report card, rendered from eval_summary.json which
+       evaluate.py writes. Aggregates over the whole benchmark set -- visually
+       heavier than the per-answer chips because it says more. */
+    .eval-row {
+        display: grid; grid-template-columns: 1fr auto;
+        gap: 3px 10px; margin-bottom: 13px;
+    }
+    .eval-label { font-size: 0.82rem; color: var(--text-primary); }
+    .eval-label .eval-dir {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem; color: var(--text-muted); margin-left: 6px;
+    }
+    .eval-score {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.82rem; color: var(--accent-amber);
+    }
+    .eval-bar {
+        grid-column: 1 / -1; height: 4px; border-radius: 2px;
+        background: var(--border); overflow: hidden;
+    }
+    .eval-bar-fill {
+        height: 100%; border-radius: 2px;
+        background: linear-gradient(90deg, var(--accent-cyan), var(--accent-amber));
+    }
+    .eval-foot {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem; color: var(--text-muted); line-height: 1.7;
+        margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--border);
+    }
+    .eval-foot code, .eval-empty code {
+        font-family: 'JetBrains Mono', monospace; font-size: 0.76rem;
+        color: var(--accent-cyan); background: rgba(77,216,232,0.08);
+        padding: 1px 5px; border-radius: 4px;
+    }
+    .eval-empty { font-size: 0.82rem; color: var(--text-muted); line-height: 1.6; margin: 0; }
+
+    /* Per-question breakdown -- which questions carry the average and which
+       drag it down. An aggregate alone hides that. */
+    .eval-perq {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem; color: var(--text-muted);
+        margin: 14px 0 8px 0; text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .eval-q { margin-bottom: 11px; }
+    .eval-q-text {
+        font-size: 0.8rem; color: var(--text-primary);
+        display: block; margin-bottom: 5px;
+    }
+    .eval-q-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+    .eval-q-chip {
+        display: inline-flex; align-items: baseline; gap: 4px;
+        border: 1px solid var(--border); border-radius: 999px;
+        background: var(--bg-deep); padding: 2px 8px;
+        font-family: 'JetBrains Mono', monospace; font-size: 0.64rem;
+        color: var(--text-muted);
+    }
+    .eval-q-chip b { font-weight: 500; font-size: 0.7rem; }
+    .eval-q-bad {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem; color: #E86A6A;
+    }
+    /* Breathing room so the report card doesn't crowd the last chat bubble. */
+    .eval-anchor { margin-top: 18px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -305,7 +370,7 @@ def render_answer_scores(scores: dict | None):
         return
 
     chips = []
-    for key, label, direction in METRICS:
+    for key, label, direction, _needs_ref in METRICS:
         val = values.get(key)
         if val is None:
             continue
@@ -324,7 +389,7 @@ def render_answer_scores(scores: dict | None):
 
     with st.expander(f"How accurate is this? — RAGAS scores ({len(chips)} metrics)"):
         parts = []
-        for key, label, direction in METRICS:
+        for key, label, direction, _needs_ref in METRICS:
             val = values.get(key)
             if val is None:
                 continue
@@ -348,10 +413,139 @@ def render_answer_scores(scores: dict | None):
             'answer and the context retrieved for it.<br/>'
             'Context Recall and Context Entity Recall have no human reference '
             'answer to compare against on a live question, so they are the '
-            'judge&rsquo;s estimate of what a complete answer would need.'
+            'judge&rsquo;s estimate of what a complete answer would need. For the '
+            'reference-measured version, see the system evaluation at the bottom '
+            'of the page.'
             "</div>"
         )
         st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# System-level evaluation report card
+# ---------------------------------------------------------------------------
+EVAL_SUMMARY_PATH = Path(__file__).parent / "eval_summary.json"
+
+
+def _summary_mtime() -> float:
+    """0.0 when the file is absent. Used as the cache key below."""
+    try:
+        return EVAL_SUMMARY_PATH.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _read_eval_summary(mtime: float):
+    """Aggregate scores from the last `python evaluate.py` run.
+
+    Read from a file rather than computed here on purpose: a full run is a
+    retrieval pass, an answer and a judge call per question, which is minutes
+    of wall-clock and dozens of Groq requests -- too slow for a page load and
+    enough to hit a rate limit. The app reads, evaluate.py writes.
+
+    `mtime` is not used in the body -- it is the cache key. Caching on the
+    filename alone meant a "file not found" result stuck for the life of the
+    process, so an app that started before the summary existed would keep
+    showing the empty state even after the file appeared. Keying on mtime
+    invalidates the moment evaluate.py rewrites it. The argument must not start
+    with an underscore: Streamlit excludes underscore-prefixed args from the
+    hash, which would silently restore the old behaviour."""
+    try:
+        with open(EVAL_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_eval_summary():
+    return _read_eval_summary(_summary_mtime())
+
+
+def render_evaluation():
+    """The whole system's numbers over the fixed question set in
+    eval_dataset.json -- distinct from the per-answer chips above, which score
+    only the reply they sit under.
+
+    Rendered once at the bottom rather than repeated per message: these are
+    corpus-level aggregates, and repeating them under each answer would read as
+    a score for that answer."""
+    summary = load_eval_summary()
+    metrics = [m for m in (summary or {}).get("metrics", []) if m.get("score") is not None]
+
+    st.markdown('<div class="eval-anchor"></div>', unsafe_allow_html=True)
+
+    if not metrics:
+        with st.expander("How good is this RAG system overall? — run the evaluation"):
+            st.markdown(
+                '<p class="eval-empty">No evaluation has been recorded yet. Run '
+                '<code>python evaluate.py</code> to answer and score every question '
+                'in <code>eval_dataset.json</code> with the real pipeline. It writes '
+                '<code>eval_summary.json</code>, and the aggregate scores appear here '
+                'automatically once that file is committed.</p>',
+                unsafe_allow_html=True,
+            )
+        return
+
+    n = summary.get("n_questions", 0)
+    scored = summary.get("n_scored", n)
+    with st.expander(f"How good is this RAG system overall? — {n} benchmark questions"):
+        parts = []
+        for m in metrics:
+            score = float(m["score"])
+            # Every metric is 0-1; clamp anyway so an out-of-range value can't
+            # blow the bar past its track.
+            pct = max(0.0, min(1.0, score)) * 100
+            direction = "lower is better" if m.get("direction") == "lower" else "higher is better"
+            n_scored = m.get("n_scored")
+            detail = direction
+            if n_scored is not None and n_scored != scored:
+                # A mean over fewer questions than were run is worth showing
+                # rather than hiding behind a confident-looking average.
+                detail += f" &middot; n={n_scored}"
+            parts.append(
+                f'<div class="eval-row">'
+                f'<span class="eval-label">{html.escape(str(m["label"]))}'
+                f'<span class="eval-dir">{detail}</span></span>'
+                f'<span class="eval-score">{score:.3f}</span>'
+                f'<div class="eval-bar"><div class="eval-bar-fill" style="width:{pct:.1f}%"></div></div>'
+                f"</div>"
+            )
+
+        foot = [
+            f'{scored} of {n} questions scored from '
+            f'<code>{html.escape(str(summary.get("dataset", "eval_dataset.json")))}</code> '
+            f'on {html.escape(str(summary.get("generated_at", "?")))}',
+            f'Answers: {html.escape(str(summary.get("answer_model", "?")))} '
+            f'&middot; Judge: {html.escape(str(summary.get("judge_model", "?")))}',
+            'Every question here has a known-correct reference answer, so Context '
+            'Recall and Context Entity Recall are measured against it and Answer '
+            'Correctness is available &mdash; none of which a live question allows.',
+        ]
+        parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
+        st.markdown("".join(parts), unsafe_allow_html=True)
+
+        rows = summary.get("questions") or []
+        if rows:
+            st.markdown('<p class="eval-perq">Per question</p>', unsafe_allow_html=True)
+            for r in rows:
+                scores = r.get("scores") or {}
+                if r.get("error"):
+                    badge = f'<span class="eval-q-bad">{html.escape(str(r["error"]))}</span>'
+                else:
+                    badge = " ".join(
+                        f'<span class="eval-q-chip {_score_tone(scores[k], d)}">'
+                        f'{html.escape(lbl.split()[-1])} <b>{scores[k]:.2f}</b></span>'
+                        for k, lbl, d, _nr in METRICS
+                        if k in scores
+                    )
+                st.markdown(
+                    f'<div class="eval-q">'
+                    f'<span class="eval-q-text">{html.escape(str(r.get("question", "")))}</span>'
+                    f'<div class="eval-q-chips">{badge}</div>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +643,10 @@ if query:
             st.error(str(e))
         except Exception as e:
             st.error(f"Something went wrong: {e}")
+
+
+# Last thing on the page, so it sits under the newest answer and is present on
+# every screen -- landing page and mid-conversation alike. st.chat_input is
+# pinned to the viewport bottom by Streamlit regardless of call order, so this
+# does not displace the input box.
+render_evaluation()

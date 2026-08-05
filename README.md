@@ -111,7 +111,9 @@ PhotonXRAG/
 ├── app.py              # Streamlit UI — chat, styling, source display, per-answer scores
 ├── ingest.py            # Document ingestion pipeline (run when source docs change)
 ├── rag_engine.py         # Retrieval, fusion, reranking, relevance filtering, LLM calls
-├── llm_metrics.py        # Per-answer RAGAS-style scoring — one judge-LLM call, no extra deps
+├── llm_metrics.py        # RAGAS-style scoring — one judge-LLM call, no extra deps
+├── evaluate.py           # Corpus-level evaluation runner → writes eval_summary.json
+├── eval_dataset.json     # Benchmark questions + known-correct reference answers
 ├── requirements.txt
 ├── assets/
 │   └── photonx-logo.png
@@ -160,6 +162,65 @@ files that actually changed.
 ```bash
 streamlit run app.py
 ```
+
+---
+
+## 📊 Measuring Quality
+
+Two layers, answering two different questions.
+
+### Per answer — "should I trust *this* reply?"
+
+Every reply in the chat carries its own scores, computed by one judge-LLM call
+in `llm_metrics.py` after the answer streams in. Six metrics as chips, with the
+judge's stated reasoning behind an expander. Toggle it off in the sidebar if
+Groq starts rate-limiting.
+
+No reference answer exists for a live question, so **Context Recall** and
+**Context Entity Recall** are the judge's estimate of what a complete answer
+would need — directional, not the textbook metric. The other four are
+reference-free by definition and measured as specified.
+
+### Whole system — "how good is this RAG pipeline?"
+
+```bash
+python evaluate.py                   # full run → writes eval_summary.json
+python evaluate.py --limit 3         # smoke test
+python evaluate.py --sleep 3         # pause between questions (rate limits)
+python evaluate.py --no-write        # print only
+```
+
+This drives the **real** pipeline over every question in `eval_dataset.json`,
+scores each answer against its known-correct reference, and writes aggregate
+numbers to `eval_summary.json`. The app renders that file as the report card at
+the bottom of the page. Commit it for the deployed app to show the numbers.
+
+Having a reference buys three things the live path cannot have:
+
+| | Per answer | Whole system |
+|---|---|---|
+| Faithfulness, Answer Relevancy, Context Precision, Noise Sensitivity | ✅ | ✅ |
+| Context Recall, Context Entity Recall | estimated | **measured vs reference** |
+| Answer Correctness | ✗ | ✅ |
+| Comparable across runs | ✗ | ✅ |
+
+That last row is the real point: rerun the same set after changing chunking,
+reranking or the prompt, and the numbers are a diff rather than an anecdote.
+
+**Extending the set** — add objects to `questions` in `eval_dataset.json`. Only
+`question` and `reference` are required. Keep references factual and terse:
+they are compared claim by claim, so editorialising invents claims the answer
+gets penalised for missing.
+
+The `out-of-scope` row is the most important one in the file. Retrieval always
+returns *something*, so that question measures whether the system declines
+instead of answering from the model's own knowledge — Answer Correctness scores
+`0.0` if it confidently answers anyway.
+
+Evaluation runs offline rather than from a button in the app: each question
+costs a retrieval pass, an answer and a judge call, which over a full set is
+minutes of wall-clock and dozens of Groq requests — enough to hit a free-tier
+rate limit and long enough to trip a Streamlit Cloud request timeout.
 
 ---
 

@@ -13,7 +13,7 @@ missing at import time.
 
 WHAT IS MEASURED
 ----------------
-One judge call scores the six metrics RAGAS reports, from the same
+One judge call scores the metrics RAGAS reports, from the same
 (question, retrieved_contexts, answer) triple the user just produced:
 
   Faithfulness          higher better - claims in the answer traceable to context
@@ -22,16 +22,25 @@ One judge call scores the six metrics RAGAS reports, from the same
   Context Recall        higher better - needed information the context actually contains
   Context Entity Recall higher better - entities in play that appear in the context
   Noise Sensitivity     LOWER  better - claims the answer got wrong or invented
+  Answer Correctness    higher better - agreement with a known-correct answer
 
-HONEST CAVEAT, WORTH KNOWING BEFORE YOU TRUST THE NUMBERS
----------------------------------------------------------
-Real RAGAS computes Context Recall and Context Entity Recall against a
-human-written `reference` answer. A live user's question has no reference, so
-those two are judged here against "what a complete answer to this question
-would need to contain" as inferred by the judge model. They are directional
-indicators, not the textbook metric. Faithfulness, Answer Relevancy, Context
-Precision and Noise Sensitivity are reference-free by definition and are
-measured as specified.
+TWO MODES, AND THE DIFFERENCE MATTERS
+-------------------------------------
+`score_answer(...)` without a `reference` is the LIVE mode used for a real
+user's question in the chat. Faithfulness, Answer Relevancy, Context Precision
+and Noise Sensitivity are reference-free by definition and are measured as
+specified. Context Recall and Context Entity Recall are NOT reference-free in
+real RAGAS - they are defined against a human-written reference answer, which a
+live question does not have. In live mode the judge estimates them against
+"what a complete answer to this question would need to contain". Directional
+indicators, not the textbook metric. Answer Correctness cannot be faked at all
+and is simply not produced.
+
+`score_answer(..., reference="...")` is the BENCHMARK mode used by
+evaluate.py over eval_dataset.json. Here a human-written reference exists, so
+Context Recall and Context Entity Recall are measured against it as RAGAS
+defines them, and Answer Correctness becomes available. This is the mode whose
+numbers describe the system rather than one reply.
 
 The prompt forces the judge to enumerate and count (claims supported / claims
 total) rather than emit a gut-feel number. That is what keeps a single LLM
@@ -63,19 +72,30 @@ JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "llama-3.3-70b-versatile")
 MAX_CONTEXTS = 6
 MAX_CONTEXT_CHARS = 4000
 
-# (json key, UI label, "higher" | "lower")
-METRICS: tuple[tuple[str, str, str], ...] = (
-    ("faithfulness", "Faithfulness", "higher"),
-    ("answer_relevancy", "Answer Relevancy", "higher"),
-    ("context_precision", "Context Precision", "higher"),
-    ("context_recall", "Context Recall", "higher"),
-    ("context_entity_recall", "Context Entity Recall", "higher"),
-    ("noise_sensitivity", "Noise Sensitivity", "lower"),
+# (json key, UI label, "higher" | "lower", needs_reference)
+# `needs_reference` metrics are only produced in benchmark mode, where
+# eval_dataset.json supplies a known-correct answer to compare against.
+METRICS: tuple[tuple[str, str, str, bool], ...] = (
+    ("faithfulness", "Faithfulness", "higher", False),
+    ("answer_relevancy", "Answer Relevancy", "higher", False),
+    ("context_precision", "Context Precision", "higher", False),
+    ("context_recall", "Context Recall", "higher", False),
+    ("context_entity_recall", "Context Entity Recall", "higher", False),
+    ("noise_sensitivity", "Noise Sensitivity", "lower", False),
+    ("answer_correctness", "Answer Correctness", "higher", True),
 )
 
-_JUDGE_SYSTEM_PROMPT = """\
-You are a strict RAG evaluation judge. You score one (question, retrieved \
-contexts, answer) triple on six metrics and reply with JSON only.
+LIVE_METRICS = tuple(m for m in METRICS if not m[3])
+
+
+def metrics_for(has_reference: bool) -> tuple[tuple[str, str, str, bool], ...]:
+    """The metric table applicable to one scoring mode."""
+    return METRICS if has_reference else LIVE_METRICS
+
+
+_PROMPT_HEAD = """\
+You are a strict RAG evaluation judge. You score one retrieval-augmented answer \
+on {n} metrics and reply with JSON only.
 
 Score every metric by COUNTING, never by impression. For each metric, first \
 identify the discrete items it is defined over, then count how many qualify, \
@@ -104,11 +124,15 @@ A context is useful if it contributed information a correct answer to the \
 QUESTION needs. Weight earlier ranks more heavily: a useless context at rank 1 \
 costs more than a useless one at the last rank.
    score = rank-weighted useful_contexts / total_contexts
+"""
 
+# Live mode: no reference exists, so recall is judged against the judge's own
+# reconstruction of what a complete answer would need.
+_DEFS_REFERENCE_FREE = """\
 4. context_recall (higher is better)
-   There is no human reference answer. Infer what a complete, correct answer to \
-the QUESTION would have to state, as a list of required points. A point is \
-covered if the CONTEXTS contain it.
+   There is no reference answer. Infer what a complete, correct answer to the \
+QUESTION would have to state, as a list of required points. A point is covered \
+if the CONTEXTS contain it.
    score = covered_points / required_points
 
 5. context_entity_recall (higher is better)
@@ -122,20 +146,64 @@ entities. An entity is present if it appears in the CONTEXTS.
 that were plausibly picked up from a context that is irrelevant to the \
 QUESTION. This is the answer being led astray by noise in retrieval.
    score = incorrect_or_noise_induced_claims / total_claims
+"""
 
+# Benchmark mode: a REFERENCE is supplied, so recall is measured against it as
+# RAGAS defines it, and correctness becomes measurable.
+_DEFS_REFERENCE_BASED = """\
+4. context_recall (higher is better)
+   Break the REFERENCE into atomic claims. A claim is attributable if the \
+CONTEXTS contain it. This measures retrieval, not the answer - ignore the \
+ANSWER entirely for this metric.
+   score = attributable_reference_claims / total_reference_claims
+
+5. context_entity_recall (higher is better)
+   List the specific entities in the REFERENCE - proper nouns, product and \
+service names, organisations, figures, dates. Generic words are not entities. \
+An entity is present if it appears in the CONTEXTS.
+   score = reference_entities_present_in_contexts / reference_entities_total
+
+6. noise_sensitivity (LOWER is better)
+   Count claims in the ANSWER that are wrong given the CONTEXTS and REFERENCE, \
+or that were plausibly picked up from a context irrelevant to the QUESTION. \
+This is the answer being led astray by noise in retrieval.
+   score = incorrect_or_noise_induced_claims / total_claims
+
+7. answer_correctness (higher is better)
+   Compare the ANSWER against the REFERENCE. Classify every claim as TP (in \
+both), FP (in the answer, absent from or contradicting the reference), or FN \
+(required by the reference, missing from the answer). Wording may differ freely \
+- judge meaning, not phrasing.
+   score = TP / (TP + 0.5 * (FP + FN))
+   If the REFERENCE states the documents cannot answer the question, then a \
+correct ANSWER is one that declines to answer; an answer that confidently \
+states facts anyway scores 0.0.
+"""
+
+_PROMPT_TAIL = """\
 Reply with this JSON object and nothing else. Every "score" is a number from \
 0.0 to 1.0, or null. Every "reason" is one sentence, under 25 words, and must \
 cite the counts.
 
-{
-  "faithfulness":          {"score": 0.0, "reason": ""},
-  "answer_relevancy":      {"score": 0.0, "reason": ""},
-  "context_precision":     {"score": 0.0, "reason": ""},
-  "context_recall":        {"score": 0.0, "reason": ""},
-  "context_entity_recall": {"score": 0.0, "reason": ""},
-  "noise_sensitivity":     {"score": 0.0, "reason": ""}
-}
+{{
+{lines}
+}}
 """
+
+
+def _build_system_prompt(has_reference: bool) -> str:
+    table = metrics_for(has_reference)
+    width = max(len(k) for k, _, _, _ in table) + 3
+    lines = ",\n".join(
+        f'  {(chr(34) + k + chr(34) + ":"):<{width}} {{"score": 0.0, "reason": ""}}'
+        for k, _, _, _ in table
+    )
+    return (
+        _PROMPT_HEAD.format(n=len(table))
+        + (_DEFS_REFERENCE_BASED if has_reference else _DEFS_REFERENCE_FREE)
+        + "\n"
+        + _PROMPT_TAIL.format(lines=lines)
+    )
 
 
 @dataclass
@@ -224,8 +292,18 @@ def _parse_judge_json(content: str) -> dict:
         return json.loads(content[start : end + 1])
 
 
-def score_answer(question: str, contexts: list[str], answer: str) -> JudgeScores:
+def score_answer(
+    question: str,
+    contexts: list[str],
+    answer: str,
+    reference: str | None = None,
+) -> JudgeScores:
     """Score one answer with a single judge-LLM call. Never raises.
+
+    Pass `reference` (a known-correct answer, as eval_dataset.json supplies) to
+    get benchmark mode: Context Recall and Context Entity Recall are then
+    measured against it as RAGAS defines them instead of being estimated, and
+    Answer Correctness is added. Omit it for a live chat question.
 
     Deliberately takes no embedder and no retrieval objects: the judge reads
     text, so scoring is decoupled from the engine that produced the answer.
@@ -236,6 +314,10 @@ def score_answer(question: str, contexts: list[str], answer: str) -> JudgeScores
         # there is nothing meaningful to score.
         return JudgeScores(error="nothing to score")
 
+    reference = (reference or "").strip()
+    has_reference = bool(reference)
+    table = metrics_for(has_reference)
+
     context_block = "\n\n".join(
         f"[Context {i}, retrieval rank {i}]\n{c}" for i, c in enumerate(contexts, 1)
     )
@@ -243,14 +325,15 @@ def score_answer(question: str, contexts: list[str], answer: str) -> JudgeScores
         f"QUESTION\n{question.strip()}\n\n"
         f"CONTEXTS ({len(contexts)} retrieved, best-first)\n{context_block}\n\n"
         f"ANSWER\n{answer.strip()}\n\n"
-        "Score the six metrics and reply with the JSON object."
+        + (f"REFERENCE (known-correct answer)\n{reference}\n\n" if has_reference else "")
+        + f"Score the {len(table)} metrics and reply with the JSON object."
     )
 
     try:
         response = _get_client().chat.completions.create(
             model=JUDGE_MODEL,
             messages=[
-                {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": _build_system_prompt(has_reference)},
                 {"role": "user", "content": user_prompt},
             ],
             # Judging must be reproducible: the same triple should not score
@@ -268,7 +351,7 @@ def score_answer(question: str, contexts: list[str], answer: str) -> JudgeScores
 
     scores: dict[str, float] = {}
     reasons: dict[str, str] = {}
-    for key, _label, _direction in METRICS:
+    for key, _label, _direction, _needs_ref in table:
         entry = payload.get(key)
         if isinstance(entry, dict):
             val = _coerce_score(entry.get("score"))
