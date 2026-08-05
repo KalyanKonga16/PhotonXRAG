@@ -43,7 +43,16 @@ st.markdown(
         --text-muted: #8A93A6;
     }
 
-    #MainMenu, footer, header { visibility: hidden; }
+    #MainMenu, footer { visibility: hidden; }
+    /* `header` used to be hidden wholesale here. That also hid the chevron that
+       opens the sidebar -- and since set_page_config sets
+       initial_sidebar_state="collapsed", the sidebar became unreachable: no way
+       to get at the "Score every answer" toggle at all. Hide the toolbar and
+       the top decoration strip instead, which is what was actually unwanted,
+       and leave the sidebar control clickable. */
+    header[data-testid="stHeader"] { background: transparent; }
+    [data-testid="stToolbar"] { visibility: hidden; height: 0; }
+    [data-testid="stDecoration"] { display: none; }
     .stApp {
         background: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(242,169,59,0.10), transparent),
                     radial-gradient(ellipse 60% 40% at 85% 15%, rgba(77,216,232,0.08), transparent),
@@ -332,42 +341,62 @@ with st.sidebar:
              "judge-LLM call. Adds a couple of seconds per question.",
     )
 
-    st.divider()
-    st.caption("**System evaluation**")
 
-    _questions = get_eval_questions()
-    if not _questions:
+def render_eval_controls():
+    """The Run-evaluation controls, rendered inside the report card in the main
+    body rather than in the sidebar.
+
+    Deliberately not in the sidebar: this page ships with the sidebar collapsed,
+    so anything living only there is a step removed from being found. Putting the
+    controls where the results appear means the button and its output are the
+    same object on the page."""
+    questions = get_eval_questions()
+    if not questions:
         st.caption(
             f"`{DEFAULT_DATASET.name}` is missing or unreadable, so there is "
             "nothing to evaluate against."
         )
-    else:
-        st.caption(
-            f"Runs the pipeline over {len(_questions)} benchmark questions with "
-            "known-correct answers, right here in the deployment. Roughly 20-40s "
-            "per question."
-        )
+        return
+
+    col_n, col_pause = st.columns(2)
+    with col_n:
         n_eval = st.number_input(
             "Questions to run",
             min_value=1,
-            max_value=len(_questions),
-            value=len(_questions),
-            help="Start with 2 to confirm the wiring before spending a full run.",
+            max_value=len(questions),
+            value=len(questions),
+            key="eval_n",
+            help="Start with 2 to confirm it works before spending a full run.",
         )
+    with col_pause:
         pause = st.number_input(
-            "Pause between questions (s)",
+            "Pause between (s)",
             min_value=0.0,
             max_value=15.0,
             value=0.0,
             step=0.5,
+            key="eval_pause",
             help="Raise this if Groq starts returning rate-limit errors. Each "
                  "question costs one answer call plus one judge call.",
         )
-        if st.button("Run evaluation", use_container_width=True):
-            # Only record the request here. The run itself happens in the main
-            # body below, where there is room to render progress -- a sidebar
-            # button handler is a poor place to hold a multi-minute loop.
+
+    est = int(n_eval) * 30 + int(n_eval) * pause
+    st.caption(
+        f"Answers and scores {int(n_eval)} of {len(questions)} benchmark "
+        f"questions in this deployment. Roughly {est // 60}m {est % 60:.0f}s. "
+        "Results stay in your session."
+    )
+
+    run_col, clear_col = st.columns(2)
+    with run_col:
+        if st.button("Run evaluation", use_container_width=True, type="primary"):
+            # Record the request and rerun. The run itself happens earlier in
+            # the script than this expander, so it cannot start until the next
+            # pass -- and it needs to be there, above the report card, so the
+            # progress log reads in order with the results it produces.
             st.session_state.run_eval = {"n": int(n_eval), "pause": float(pause)}
+            st.rerun()
+    with clear_col:
         if st.session_state.eval_summary:
             if st.button("Clear results", use_container_width=True):
                 st.session_state.eval_summary = None
@@ -610,10 +639,10 @@ def render_evaluation():
     if not metrics:
         with st.expander("How good is this RAG system overall? — run the evaluation"):
             st.markdown(
-                '<p class="eval-empty">No evaluation has been recorded yet. Open the '
-                'sidebar and press <strong>Run evaluation</strong> to answer and score '
-                f'every question in <code>{html.escape(DEFAULT_DATASET.name)}</code> '
-                'with the real pipeline, right here in this deployment.<br/><br/>'
+                '<p class="eval-empty">No evaluation has been recorded yet. Press '
+                '<strong>Run evaluation</strong> below to answer and score every '
+                f'question in <code>{html.escape(DEFAULT_DATASET.name)}</code> with '
+                'the real pipeline, right here in this deployment.<br/><br/>'
                 'Results stay in your session. To make them the default every visitor '
                 'sees, download the summary afterwards and commit it as '
                 '<code>eval_summary.json</code> &mdash; or run '
@@ -621,6 +650,7 @@ def render_evaluation():
                 'directly.</p>',
                 unsafe_allow_html=True,
             )
+            render_eval_controls()
         return
 
     n = summary.get("n_questions", 0)
@@ -676,6 +706,9 @@ def render_evaluation():
                 help="Commit this to the repo to make these the numbers every "
                      "visitor sees, instead of only this session.",
             )
+
+        st.divider()
+        render_eval_controls()
 
         rows = summary.get("questions") or []
         if rows:

@@ -186,10 +186,10 @@ reference-free by definition and measured as specified.
 Both paths run the **same** code over the same questions and produce the same
 report card. Pick whichever suits you.
 
-**From the deployed app** — open the sidebar, set how many questions, press
-**Run evaluation**. It answers and scores each question inside the deployment,
-logging progress as it goes, then renders the report card. Roughly 20–40s per
-question.
+**From the deployed app** — expand **"How good is this RAG system overall?"** at
+the bottom of the page, set how many questions, press **Run evaluation**. It
+answers and scores each question inside the deployment, logging progress as it
+goes, then renders the report card. Roughly 20–40s per question.
 
 Results live in your browser session only, and are gone on reboot or for the
 next visitor. To make them the default everyone sees, use the
