@@ -108,9 +108,10 @@ return several, without ever needing a hand-tuned magic number.
 
 ```
 PhotonXRAG/
-├── app.py              # Streamlit UI — chat, styling, source display
+├── app.py              # Streamlit UI — chat, styling, source display, per-answer scores
 ├── ingest.py            # Document ingestion pipeline (run when source docs change)
 ├── rag_engine.py         # Retrieval, fusion, reranking, relevance filtering, LLM calls
+├── llm_metrics.py        # Per-answer RAGAS-style scoring — one judge-LLM call, no extra deps
 ├── requirements.txt
 ├── assets/
 │   └── photonx-logo.png

@@ -5,12 +5,11 @@ A polished, chat-first landing experience over the hybrid RAG engine in rag_engi
 
 import base64
 import html
-import json
 from pathlib import Path
 
 import streamlit as st
 from rag_engine import load_resources, ask
-from live_metrics import score_answer
+from llm_metrics import JUDGE_MODEL, METRICS, score_answer
 
 LOGO_PATH = Path(__file__).parent / "assets" / "photonx-logo.png"
 LOGO_B64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
@@ -140,40 +139,10 @@ st.markdown(
 
     div[data-testid="stChatInput"] textarea { font-family: 'Inter', sans-serif !important; }
 
-    /* RAGAS scores. Rendered from ragas_live_summary.json, which CI commits
-       after each live eval run -- the app never computes these itself. */
-    .eval-row {
-        display: grid; grid-template-columns: 1fr auto;
-        gap: 3px 10px; margin-bottom: 13px;
-    }
-    .eval-label { font-size: 0.82rem; color: var(--text-primary); }
-    .eval-label .eval-dir {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.68rem; color: var(--text-muted); margin-left: 6px;
-    }
-    .eval-score {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.82rem; color: var(--accent-amber);
-    }
-    .eval-bar {
-        grid-column: 1 / -1; height: 4px; border-radius: 2px;
-        background: var(--border); overflow: hidden;
-    }
-    .eval-bar-fill {
-        height: 100%; border-radius: 2px;
-        background: linear-gradient(90deg, var(--accent-cyan), var(--accent-amber));
-    }
-    .eval-foot {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem; color: var(--text-muted); line-height: 1.7;
-        margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--border);
-    }
-    .eval-foot a { color: var(--accent-cyan); text-decoration: none; }
-    .eval-foot a:hover { text-decoration: underline; }
-    .eval-empty { font-size: 0.82rem; color: var(--text-muted); line-height: 1.6; margin: 0; }
-
-    /* Per-answer scores, rendered under each reply. Deliberately quiet -- a
-       metadata strip, not a second headline competing with the answer. */
+    /* Per-answer RAGAS scores, computed by the judge-LLM call in
+       llm_metrics.py and rendered under the reply they belong to.
+       Deliberately quiet -- a metadata strip, not a second headline
+       competing with the answer. */
     .score-strip {
         display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
         margin-top: 9px;
@@ -189,16 +158,43 @@ st.markdown(
     .score-good b { color: #5FD08A; }
     .score-mid  b { color: var(--accent-amber); }
     .score-low  b { color: #E86A6A; }
+    /* Marks the metric where a low number is the good outcome, so a green
+       0.05 next to a green 0.95 doesn't read as a bug. */
+    .score-chip i {
+        font-style: normal; font-size: 0.62rem; color: var(--text-muted);
+        opacity: 0.75;
+    }
     .score-note { font-family: 'JetBrains Mono', monospace;
                   font-size: 0.68rem; color: var(--text-muted); }
-    .eval-empty code {
-        font-family: 'JetBrains Mono', monospace; font-size: 0.76rem;
-        color: var(--accent-cyan); background: rgba(77,216,232,0.08);
-        padding: 1px 5px; border-radius: 4px;
+
+    /* The judge's own justification per metric, inside the expander. */
+    .why-row {
+        display: grid; grid-template-columns: 1fr auto;
+        gap: 2px 10px; margin-bottom: 12px;
     }
-    /* Breathing room so the always-on scores panel doesn't crowd the last
-       chat bubble above it. */
-    .eval-anchor { margin-top: 18px; }
+    .why-label { font-size: 0.8rem; color: var(--text-primary); }
+    .why-score {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.8rem; color: var(--accent-amber);
+    }
+    .why-bar {
+        grid-column: 1 / -1; height: 4px; border-radius: 2px;
+        background: var(--border); overflow: hidden;
+    }
+    .why-bar-fill {
+        height: 100%; border-radius: 2px;
+        background: linear-gradient(90deg, var(--accent-cyan), var(--accent-amber));
+    }
+    .why-reason {
+        grid-column: 1 / -1;
+        font-size: 0.76rem; color: var(--text-muted);
+        line-height: 1.5; margin: 3px 0 0 0;
+    }
+    .why-foot {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem; color: var(--text-muted); line-height: 1.7;
+        margin-top: 2px; padding-top: 9px; border-top: 1px solid var(--border);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -239,15 +235,15 @@ if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
 if "score_answers" not in st.session_state:
     # On by default; the sidebar toggle is the escape hatch when Groq starts
-    # rate-limiting, since scoring triples the request count per question.
+    # rate-limiting, since scoring adds one request per question.
     st.session_state.score_answers = True
 
 with st.sidebar:
     st.toggle(
         "Score every answer",
         key="score_answers",
-        help="Runs RAGAS Faithfulness and Response Relevancy on each reply. "
-             "Adds a few seconds and 3-4 extra Groq calls per question.",
+        help="Scores all six RAGAS metrics on each reply using one extra "
+             "judge-LLM call. Adds a couple of seconds per question.",
     )
 
 
@@ -276,11 +272,23 @@ def render_sources(sources: list[dict]):
         st.markdown("".join(parts), unsafe_allow_html=True)
 
 
-def render_answer_scores(scores: dict | None):
-    """The two reference-free RAGAS metrics for one specific answer.
+def _score_tone(value: float, direction: str) -> str:
+    """Green/amber/red for one score. Noise Sensitivity is the one metric where
+    low is the good outcome, so its thresholds are inverted rather than
+    reusing the higher-is-better bands and colouring a good answer red."""
+    if direction == "lower":
+        return "score-good" if value <= 0.15 else ("score-mid" if value <= 0.30 else "score-low")
+    return "score-good" if value >= 0.85 else ("score-mid" if value >= 0.70 else "score-low")
 
-    Separate from render_evaluation(): that one is a corpus-level report card
-    over the fixed eval set, this is about the reply directly above it."""
+
+def render_answer_scores(scores: dict | None):
+    """All six RAGAS metrics for the one answer directly above, as judged by
+    llm_metrics.score_answer.
+
+    Two tiers on purpose: the chip strip is always visible so every answer
+    carries its own numbers, and the expander holds the judge's stated reason
+    for each one -- which is the part that makes a score arguable rather than
+    something you either trust or don't."""
     if not scores:
         return
     if scores.get("error"):
@@ -291,98 +299,58 @@ def render_answer_scores(scores: dict | None):
         )
         return
 
-    chips = []
-    for key, label, floor in (
-        ("faithfulness", "Faithfulness", 0.7),
-        ("answer_relevancy", "Relevancy", 0.7),
-    ):
-        val = scores.get(key)
-        if val is None:
-            continue
-        tone = "score-good" if val >= 0.85 else ("score-mid" if val >= floor else "score-low")
-        chips.append(
-            f'<span class="score-chip {tone}">{label} <b>{val:.2f}</b></span>'
-        )
-    if chips:
-        st.markdown(
-            '<div class="score-strip">' + "".join(chips) + "</div>",
-            unsafe_allow_html=True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# RAGAS evaluation report
-# ---------------------------------------------------------------------------
-EVAL_SUMMARY_PATH = Path(__file__).parent / "ragas_live_summary.json"
-
-
-@st.cache_data(show_spinner=False)
-def load_eval_summary():
-    """Scores from the last .github/workflows/ragas-live.yml run, which drives
-    this deployment with Playwright and commits the result back.
-
-    Deliberately read from a file rather than computed here: ragas + datasets
-    + torch is ~2GB against Streamlit Cloud's ~1GB container, and scoring one
-    question costs 6 judge-LLM calls."""
-    try:
-        with open(EVAL_SUMMARY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def render_evaluation():
-    """Always rendered, at the bottom of the page, so the scores stay reachable
-    at any point in the conversation instead of only on the landing screen.
-
-    Rendered once rather than repeated under each answer on purpose: these are
-    corpus-level aggregates over the eval set, not a score for the answer you
-    just got. Repeating them per-message would read as the latter."""
-    summary = load_eval_summary()
-    metrics = [m for m in (summary or {}).get("metrics", []) if m.get("score") is not None]
-
-    st.markdown('<div class="eval-anchor"></div>', unsafe_allow_html=True)
-
-    if not metrics:
-        with st.expander("How accurate is this? — RAGAS evaluation"):
-            st.markdown(
-                '<p class="eval-empty">No evaluation run has been recorded yet. '
-                'Run the <strong>RAGAS (live deployment)</strong> workflow from the '
-                'Actions tab of the repository. It scores this deployment end to end '
-                'and commits <code>ragas_live_summary.json</code>, and the six metric '
-                'scores then appear here automatically.</p>',
-                unsafe_allow_html=True,
-            )
+    values = scores.get("scores") or {}
+    reasons = scores.get("reasons") or {}
+    if not values:
         return
 
-    n = summary.get("n_questions", 0)
-    with st.expander(f"How accurate is this? — RAGAS scores ({n} eval questions)"):
+    chips = []
+    for key, label, direction in METRICS:
+        val = values.get(key)
+        if val is None:
+            continue
+        arrow = ' <i>&darr;</i>' if direction == "lower" else ""
+        chips.append(
+            f'<span class="score-chip {_score_tone(val, direction)}">'
+            f'{html.escape(label)} <b>{val:.2f}</b>{arrow}</span>'
+        )
+    if not chips:
+        return
+
+    st.markdown(
+        '<div class="score-strip">' + "".join(chips) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander(f"How accurate is this? — RAGAS scores ({len(chips)} metrics)"):
         parts = []
-        for m in metrics:
-            score = float(m["score"])
-            # Every metric here is 0-1; clamp anyway so a NaN-ish or
-            # out-of-range value can't blow the bar past its track.
-            pct = max(0.0, min(1.0, score)) * 100
-            direction = "lower is better" if m.get("direction") == "lower" else "higher is better"
+        for key, label, direction in METRICS:
+            val = values.get(key)
+            if val is None:
+                continue
+            # Every metric is defined on 0-1; clamp anyway so an out-of-range
+            # value from the judge can't blow the bar past its track.
+            pct = max(0.0, min(1.0, val)) * 100
+            hint = "lower is better" if direction == "lower" else "higher is better"
+            reason = reasons.get(key)
             parts.append(
-                f'<div class="eval-row">'
-                f'<span class="eval-label">{html.escape(str(m["label"]))}'
-                f'<span class="eval-dir">{direction}</span></span>'
-                f'<span class="eval-score">{score:.3f}</span>'
-                f'<div class="eval-bar"><div class="eval-bar-fill" style="width:{pct:.1f}%"></div></div>'
+                f'<div class="why-row">'
+                f'<span class="why-label">{html.escape(label)}</span>'
+                f'<span class="why-score">{val:.2f}</span>'
+                f'<div class="why-bar"><div class="why-bar-fill" style="width:{pct:.1f}%"></div></div>'
+                + (f'<p class="why-reason">{html.escape(reason)}</p>' if reason else "")
+                + f'<p class="why-reason">({hint})</p>'
                 f"</div>"
             )
-
-        foot = [
-            f'Measured against the live deployment on '
-            f'{html.escape(str(summary.get("generated_at", "?")))}',
-            f'Judge LLM: {html.escape(str(summary.get("judge_model", "?")))}',
-        ]
-        run_url = summary.get("run_url")
-        if run_url:
-            foot.append(f'<a href="{html.escape(str(run_url))}" target="_blank">View the CI run ↗</a>')
-        parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
-
+        parts.append(
+            '<div class="why-foot">'
+            f'Judged by {html.escape(JUDGE_MODEL)} in one call, scored from this '
+            'answer and the context retrieved for it.<br/>'
+            'Context Recall and Context Entity Recall have no human reference '
+            'answer to compare against on a live question, so they are the '
+            'judge&rsquo;s estimate of what a complete answer would need.'
+            "</div>"
+        )
         st.markdown("".join(parts), unsafe_allow_html=True)
 
 
@@ -456,23 +424,17 @@ if query:
 
             render_sources(sources)
 
-            # Scored only after the answer is on screen, so the judge calls
-            # (3-4 extra Groq requests) never delay the reply itself. Stored on
-            # the message so Streamlit's reruns replay it instead of re-billing.
+            # Scored only after the answer is on screen, so the judge call
+            # never delays the reply itself. Stored on the message so
+            # Streamlit's reruns replay it instead of re-billing.
             scores = None
             if st.session_state.get("score_answers", True) and chunks:
                 with st.spinner("Scoring this answer..."):
-                    result = score_answer(
+                    scores = score_answer(
                         question=query,
                         contexts=[c["text"] for c in chunks],
                         answer=full_answer,
-                        embedder=resources.embedder,
-                    )
-                scores = {
-                    "faithfulness": result.faithfulness,
-                    "answer_relevancy": result.answer_relevancy,
-                    "error": result.error,
-                }
+                    ).as_dict()
                 render_answer_scores(scores)
 
             st.session_state.messages.append(
@@ -487,10 +449,3 @@ if query:
             st.error(str(e))
         except Exception as e:
             st.error(f"Something went wrong: {e}")
-
-
-# Last thing on the page, so it sits under the newest answer and is present on
-# every screen -- landing page and mid-conversation alike. st.chat_input is
-# pinned to the viewport bottom by Streamlit regardless of call order, so this
-# does not displace the input box.
-render_evaluation()

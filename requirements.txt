@@ -8,12 +8,11 @@ rank_bm25
 groq
 streamlit
 
-# --- per-answer RAGAS scoring (live_metrics.py) ---
-# torch/transformers are NOT added by these: sentence-transformers above
-# already pulls them in, and live_metrics.py reuses the embedding model the
-# app has loaded rather than instantiating a second one.
+# Per-answer RAGAS-style scoring (llm_metrics.py) adds NO dependencies. It is
+# a single judge-LLM call over the `groq` client already listed above.
 #
-# ragas brings datasets + langchain-core + pydantic transitively.
-# langchain-groq is the judge-LLM client (ChatGroq).
-ragas
-langchain-groq
+# `ragas` and `langchain-groq` used to be here. They pull datasets + pyarrow +
+# langchain-core transitively, the install exceeded what a Streamlit Community
+# Cloud container will take, and pip failed while the app still booted - which
+# is exactly how the UI ended up printing "ragas unavailable
+# (ModuleNotFoundError)" on every answer. Do not add them back.
