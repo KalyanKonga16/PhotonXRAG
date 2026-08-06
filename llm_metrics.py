@@ -28,18 +28,19 @@ TWO MODES, AND THE DIFFERENCE MATTERS
 `score_answer(...)` without a `reference` is the LIVE mode used for a real
 user's question in the chat. Faithfulness, Answer Relevancy and Context
 Precision are reference-free by definition and are measured as specified.
-Context Recall and Context Entity Recall are NOT reference-free in real
-RAGAS - they are defined against a human-written reference answer, which a
-live question does not have. In live mode the judge estimates them against
-"what a complete answer to this question would need to contain". Directional
-indicators, not the textbook metric. Answer Correctness cannot be faked at all
-and is simply not produced.
+Context Recall, Context Entity Recall and Answer Correctness are NOT
+reference-free in real RAGAS - they are defined against a human-written
+reference answer, which a live question does not have. In live mode the judge
+estimates them instead: Context Recall / Context Entity Recall against "what a
+complete answer to this question would need to contain", and Answer
+Correctness against a reference the judge silently drafts from the CONTEXTS
+before scoring. Directional indicators, not the textbook metric.
 
 `score_answer(..., reference="...")` is the BENCHMARK mode used by
 evaluate.py over eval_dataset.json. Here a human-written reference exists, so
-Context Recall and Context Entity Recall are measured against it as RAGAS
-defines them, and Answer Correctness becomes available. This is the mode whose
-numbers describe the system rather than one reply.
+Context Recall, Context Entity Recall and Answer Correctness are all measured
+against it as RAGAS defines them, instead of the judge's own estimate. This is
+the mode whose numbers describe the system rather than one reply.
 
 The prompt forces the judge to enumerate and count (claims supported / claims
 total) rather than emit a gut-feel number. That is what keeps a single LLM
@@ -72,8 +73,11 @@ MAX_CONTEXTS = 6
 MAX_CONTEXT_CHARS = 4000
 
 # (json key, UI label, "higher" | "lower", needs_reference)
-# `needs_reference` metrics are only produced in benchmark mode, where
-# eval_dataset.json supplies a known-correct answer to compare against.
+# `needs_reference` now only flags which metrics get the stricter,
+# human-reference-based definition when one is available (benchmark mode).
+# All six metrics are produced in both modes: without a human reference,
+# answer_correctness (and context_recall / context_entity_recall) fall back
+# to a judge-synthesized reference instead of being omitted.
 METRICS: tuple[tuple[str, str, str, bool], ...] = (
     ("faithfulness", "Faithfulness", "higher", False),
     ("answer_relevancy", "Answer Relevancy", "higher", False),
@@ -83,12 +87,17 @@ METRICS: tuple[tuple[str, str, str, bool], ...] = (
     ("answer_correctness", "Answer Correctness", "higher", True),
 )
 
-LIVE_METRICS = tuple(m for m in METRICS if not m[3])
+# All six metrics apply in every mode now. Kept as a separate name (rather
+# than inlining METRICS everywhere) so callers that import LIVE_METRICS keep
+# working unchanged.
+LIVE_METRICS = METRICS
 
 
 def metrics_for(has_reference: bool) -> tuple[tuple[str, str, str, bool], ...]:
-    """The metric table applicable to one scoring mode."""
-    return METRICS if has_reference else LIVE_METRICS
+    """The metric table applicable to one scoring mode. Same six metrics
+    either way - only the definitions used to score them differ (see
+    `_DEFS_REFERENCE_FREE` vs `_DEFS_REFERENCE_BASED`)."""
+    return METRICS
 
 
 _PROMPT_HEAD = """\
@@ -125,7 +134,8 @@ costs more than a useless one at the last rank.
 """
 
 # Live mode: no reference exists, so recall is judged against the judge's own
-# reconstruction of what a complete answer would need.
+# reconstruction of what a complete answer would need, and correctness is
+# judged against a reference the judge synthesizes itself.
 _DEFS_REFERENCE_FREE = """\
 4. context_recall (higher is better)
    There is no reference answer. Infer what a complete, correct answer to the \
@@ -138,6 +148,21 @@ if the CONTEXTS contain it.
 product and service names, organisations, figures, dates. Generic words are not \
 entities. An entity is present if it appears in the CONTEXTS.
    score = entities_present / entities_total
+
+6. answer_correctness (higher is better)
+   There is no human-written reference. First, silently draft the ideal, \
+complete answer to the QUESTION using only the CONTEXTS - this is your \
+SYNTHESIZED REFERENCE. Do not output it. Then compare the ANSWER against that \
+SYNTHESIZED REFERENCE exactly as you would a real one: classify every claim as \
+TP (in both), FP (in the ANSWER, absent from or contradicting the synthesized \
+reference), or FN (required by the synthesized reference, missing from the \
+ANSWER). Wording may differ freely - judge meaning, not phrasing.
+   score = TP / (TP + 0.5 * (FP + FN))
+   If the CONTEXTS do not contain enough to answer the QUESTION at all, then a \
+correct ANSWER is one that declines to answer; an answer that confidently \
+states facts anyway scores 0.0. Because this reference is judge-synthesized \
+rather than human-written, treat this score as an estimate, same as context_recall \
+and context_entity_recall above.
 """
 
 # Benchmark mode: a REFERENCE is supplied, so recall is measured against it as
@@ -325,7 +350,7 @@ def score_answer(
             # Judging must be reproducible: the same triple should not score
             # differently on a rerun.
             temperature=0,
-            max_tokens=900,
+            max_tokens=1000,
             response_format={"type": "json_object"},
         )
         payload = _parse_judge_json(response.choices[0].message.content or "{}")
