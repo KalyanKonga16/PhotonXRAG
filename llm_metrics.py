@@ -21,16 +21,15 @@ One judge call scores the metrics RAGAS reports, from the same
   Context Precision     higher better - retrieved contexts that were worth retrieving
   Context Recall        higher better - needed information the context actually contains
   Context Entity Recall higher better - entities in play that appear in the context
-  Noise Sensitivity     LOWER  better - claims the answer got wrong or invented
   Answer Correctness    higher better - agreement with a known-correct answer
 
 TWO MODES, AND THE DIFFERENCE MATTERS
 -------------------------------------
 `score_answer(...)` without a `reference` is the LIVE mode used for a real
-user's question in the chat. Faithfulness, Answer Relevancy, Context Precision
-and Noise Sensitivity are reference-free by definition and are measured as
-specified. Context Recall and Context Entity Recall are NOT reference-free in
-real RAGAS - they are defined against a human-written reference answer, which a
+user's question in the chat. Faithfulness, Answer Relevancy and Context
+Precision are reference-free by definition and are measured as specified.
+Context Recall and Context Entity Recall are NOT reference-free in real
+RAGAS - they are defined against a human-written reference answer, which a
 live question does not have. In live mode the judge estimates them against
 "what a complete answer to this question would need to contain". Directional
 indicators, not the textbook metric. Answer Correctness cannot be faked at all
@@ -81,7 +80,6 @@ METRICS: tuple[tuple[str, str, str, bool], ...] = (
     ("context_precision", "Context Precision", "higher", False),
     ("context_recall", "Context Recall", "higher", False),
     ("context_entity_recall", "Context Entity Recall", "higher", False),
-    ("noise_sensitivity", "Noise Sensitivity", "lower", False),
     ("answer_correctness", "Answer Correctness", "higher", True),
 )
 
@@ -140,12 +138,6 @@ if the CONTEXTS contain it.
 product and service names, organisations, figures, dates. Generic words are not \
 entities. An entity is present if it appears in the CONTEXTS.
    score = entities_present / entities_total
-
-6. noise_sensitivity (LOWER is better)
-   Count claims in the ANSWER that are factually wrong given the CONTEXTS, or \
-that were plausibly picked up from a context that is irrelevant to the \
-QUESTION. This is the answer being led astray by noise in retrieval.
-   score = incorrect_or_noise_induced_claims / total_claims
 """
 
 # Benchmark mode: a REFERENCE is supplied, so recall is measured against it as
@@ -163,13 +155,7 @@ service names, organisations, figures, dates. Generic words are not entities. \
 An entity is present if it appears in the CONTEXTS.
    score = reference_entities_present_in_contexts / reference_entities_total
 
-6. noise_sensitivity (LOWER is better)
-   Count claims in the ANSWER that are wrong given the CONTEXTS and REFERENCE, \
-or that were plausibly picked up from a context irrelevant to the QUESTION. \
-This is the answer being led astray by noise in retrieval.
-   score = incorrect_or_noise_induced_claims / total_claims
-
-7. answer_correctness (higher is better)
+6. answer_correctness (higher is better)
    Compare the ANSWER against the REFERENCE. Classify every claim as TP (in \
 both), FP (in the answer, absent from or contradicting the reference), or FN \
 (required by the reference, missing from the answer). Wording may differ freely \
