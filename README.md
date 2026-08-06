@@ -75,8 +75,7 @@ flowchart TD
     D1 --> F["Reciprocal Rank Fusion"]
     D2 --> F
     F --> R["Cross-encoder reranks<br/>(BAAI/bge-reranker-base)"]
-    R --> S["Cliff-detection relevance filter<br/>— keeps only what's truly relevant<br/>to THIS question"]
-    S --> L["Llama 3.3 70B (Groq)<br/>answers ONLY from kept chunks"]
+    R --> L["Llama 3.3 70B (Groq)<br/>answers ONLY from kept chunks"]
     L --> UI["Streamed answer +<br/>expandable Sources panel"]
 ```
 
@@ -215,7 +214,7 @@ Having a reference buys three things the live path cannot have:
 
 | | Per answer | Whole system |
 |---|---|---|
-| Faithfulness, Answer Relevancy, Context Precision, Noise Sensitivity | ✅ | ✅ |
+| Faithfulness, Answer Relevancy, Context Precision | ✅ | ✅ |
 | Context Recall, Context Entity Recall | estimated | **measured vs reference** |
 | Answer Correctness | ✗ | ✅ |
 | Comparable across runs | ✗ | ✅ |
