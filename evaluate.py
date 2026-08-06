@@ -55,7 +55,10 @@ DEFAULT_SUMMARY = ROOT / "eval_summary.json"
 # gate - just the line under which a number is worth looking at rather than
 # skimming past.
 ATTENTION_FLOOR = 0.70
-NOISE_CEILING = 0.30  # noise_sensitivity is inverted: high is the bad direction
+# Generic mirror of ATTENTION_FLOOR for any "lower is better" metric (none
+# currently defined in METRICS, but the mechanism stays generic rather than
+# being tied to one specific metric's name).
+LOWER_IS_BETTER_CEILING = 1.0 - ATTENTION_FLOOR
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -187,7 +190,7 @@ def needs_attention(metric: dict) -> bool:
     if metric["score"] is None:
         return False
     if metric["direction"] == "lower":
-        return metric["score"] > NOISE_CEILING
+        return metric["score"] > LOWER_IS_BETTER_CEILING
     return metric["score"] < ATTENTION_FLOOR
 
 
