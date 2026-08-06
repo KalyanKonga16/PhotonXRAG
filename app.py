@@ -502,11 +502,12 @@ def render_answer_scores(scores: dict | None):
             '<div class="why-foot">'
             f'Judged by {html.escape(JUDGE_MODEL)} in one call, scored from this '
             'answer and the context retrieved for it.<br/>'
-            'Context Recall and Context Entity Recall have no human reference '
-            'answer to compare against on a live question, so they are the '
-            'judge&rsquo;s estimate of what a complete answer would need. For the '
-            'reference-measured version, see the system evaluation at the bottom '
-            'of the page.'
+            'Context Recall, Context Entity Recall and Answer Correctness have '
+            'no human reference answer to compare against on a live question, so '
+            'they are the judge&rsquo;s estimate - the last one against a '
+            'reference it drafts itself from the retrieved context. For the '
+            'human-reference-measured version, see the system evaluation at the '
+            'bottom of the page.'
             "</div>"
         )
         st.markdown("".join(parts), unsafe_allow_html=True)
