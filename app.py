@@ -429,9 +429,9 @@ def render_sources(sources: list[dict]):
 
 
 def _score_tone(value: float, direction: str) -> str:
-    """Green/amber/red for one score. Noise Sensitivity is the one metric where
-    low is the good outcome, so its thresholds are inverted rather than
-    reusing the higher-is-better bands and colouring a good answer red."""
+    """Green/amber/red for one score. Any "lower is better" metric has its
+    thresholds inverted rather than reusing the higher-is-better bands and
+    colouring a good answer red."""
     if direction == "lower":
         return "score-good" if value <= 0.15 else ("score-mid" if value <= 0.30 else "score-low")
     return "score-good" if value >= 0.85 else ("score-mid" if value >= 0.70 else "score-low")
