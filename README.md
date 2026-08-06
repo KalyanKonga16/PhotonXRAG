@@ -175,10 +175,12 @@ in `llm_metrics.py` after the answer streams in. Six metrics as chips, with the
 judge's stated reasoning behind an expander. Toggle it off in the sidebar if
 Groq starts rate-limiting.
 
-No reference answer exists for a live question, so **Context Recall** and
-**Context Entity Recall** are the judge's estimate of what a complete answer
-would need — directional, not the textbook metric. The other four are
-reference-free by definition and measured as specified.
+No reference answer exists for a live question, so **Context Recall**,
+**Context Entity Recall** and **Answer Correctness** are the judge's estimate:
+the first two against what a complete answer would need, the last against a
+reference the judge drafts itself from the retrieved context — directional,
+not the textbook metric. The other three are reference-free by definition and
+measured as specified.
 
 ### Whole system — "how good is this RAG pipeline?"
 
@@ -216,7 +218,7 @@ Having a reference buys three things the live path cannot have:
 |---|---|---|
 | Faithfulness, Answer Relevancy, Context Precision | ✅ | ✅ |
 | Context Recall, Context Entity Recall | estimated | **measured vs reference** |
-| Answer Correctness | ✗ | ✅ |
+| Answer Correctness | estimated (vs. a judge-drafted reference) | **measured vs human reference** |
 | Comparable across runs | ✗ | ✅ |
 
 That last row is the real point: rerun the same set after changing chunking,
