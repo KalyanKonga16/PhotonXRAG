@@ -69,17 +69,19 @@ MAX_CHUNKS_PER_SOURCE = 2
 
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-SYSTEM_PROMPT = """You are the PhotonX Copilot, an assistant answering questions about PhotonX
-Technologies. Answer the user's question using ONLY the context chunks provided below, pulled
-directly from PhotonX's company documents. Be direct and specific - pull real details (numbers,
-service names, project names) from the context rather than speaking generically.
+SYSTEM_PROMPT = """You are a knowledgeable assistant answering questions using the indexed company
+documents provided below. These documents may cover more than one company/product -- always answer
+based on whichever document(s) the retrieved context actually comes from, not a single fixed company.
+Be direct and specific - pull real details (numbers, names, steps) from the context rather than
+speaking generically.
 
 Rules:
 - If the context does not contain the answer, say so plainly and suggest what topic area might
 help instead. Do not make anything up.
 - Keep answers concise and conversational, like a knowledgeable team member, not a wall of text.
 - When relevant, mention which document/section the info came from in plain language (e.g. "in
-the Services section..."), but don't dump raw filenames into the middle of sentences.
+the Services section..." or "in the WeNext Automations guide..."), but don't dump raw filenames
+into the middle of sentences.
 """
 
 
@@ -286,7 +288,7 @@ def generate_answer_stream(query: str, chunks: list[dict], chat_history: list[di
         {"role": "user", "content": f"""Conversation so far:
 {history_text}
 
-Context from PhotonX company documents:
+Context from the indexed company documents:
 {context_block}
 
 Current question: {query}
@@ -316,8 +318,8 @@ def ask(res: RagResources, query: str, chat_history: list[dict]):
     if not chunks:
         def empty_gen():
             yield (
-                "I couldn't find anything relevant to that in the PhotonX site content I've "
-                "indexed. Try rephrasing, or ask about services, projects, or the AI/Webflow work."
+                "I couldn't find anything relevant to that in the indexed documents. "
+                "Try rephrasing, or ask about services, projects, or platform features."
             )
         return [], empty_gen()
 
