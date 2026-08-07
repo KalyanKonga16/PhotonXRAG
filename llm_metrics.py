@@ -51,6 +51,19 @@ anchor to it, and the resulting reference is then handed to DeepEval exactly
 like a human-written one. If that call fails, scoring degrades to the two
 reference-free metrics rather than failing outright.
 
+WHAT THIS COSTS, AND WHY THE DEFAULTS LOOK STINGY
+-------------------------------------------------
+DeepEval buys its reliability by asking many small questions instead of one
+big one: roughly 13 calls per scored answer, with the retrieval context
+resent on most of them. That is a different cost shape from the single-call
+judge this replaced, where context was sent exactly once - and the settings
+below were retuned for it after a 6-context / 4000-char budget burned a
+Groq free tier's entire daily token allowance in three questions.
+
+Measured, per scored answer: ~29.5k input tokens at 6x4000, ~10k at 3x1500.
+The judge also runs on its own model (see JUDGE_MODEL) so that scoring can
+never exhaust the allowance the chat needs to answer at all.
+
 Fail-safe by construction: any failure - missing key, rate limit, deepeval not
 installed, one metric erroring - is contained. A metric that fails is dropped
 from the result; only a total failure produces an `error` string. It never
@@ -75,26 +88,102 @@ os.environ.setdefault("DEEPEVAL_UPDATE_WARNING_OPT_OUT", "YES")
 
 from groq import Groq
 
-# Same model family that writes the answers. Overridable so the judge can be
-# pointed at a different (e.g. cheaper, or deliberately independent) model
-# without touching the answer path.
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "llama-3.3-70b-versatile")
+def _secret(name: str) -> str | None:
+    """An API key from the environment, falling back to Streamlit secrets.
+    Both are checked because evaluate.py runs outside Streamlit (env / .env)
+    while the deployed app usually only has .streamlit/secrets.toml."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
 
-# Long contexts make every metric slower and push the judge toward its token
-# ceiling. Faithfulness only needs enough context to verify the claims.
-MAX_CONTEXTS = 6
-MAX_CONTEXT_CHARS = 4000
+        return st.secrets[name]
+    except Exception:
+        return None
+
+
+# ANSWERING AND SCORING MUST NOT SHARE A QUOTA
+# --------------------------------------------
+# rag_engine.LLM_MODEL_NAME writes the answers; this writes the scores. Keeping
+# them on separate models is not a tuning preference, it is what stops scoring
+# from starving the chat: DeepEval spends ~10k tokens per scored answer, so on
+# a shared model it eats the whole daily allowance in a few questions and every
+# later question then dies on a 429 *before it is even answered*.
+#
+# ONE API KEY COVERS BOTH. Groq keys are per account, not per model, so a
+# GROQ_API_KEY in .streamlit/secrets.toml authenticates the answer model and
+# the judge model alike. A second secret is needed only for option 2 below,
+# where the judge moves to a different company.
+#
+# Two levels of separation, and the second is strictly better:
+#
+#   1. Different model, same Groq account (the default). Groq's token-per-day
+#      limit is per-model, so openai/gpt-oss-20b's 200k/day pool is separate
+#      from the answer model's own 200k. Nothing to sign up for. Avoid
+#      llama-3.1-8b-instant despite its larger 500k/day pool - DeepEval asks
+#      the judge for schema-constrained verdicts and an 8B model fails that
+#      often enough to silently drop metrics.
+#
+#   2. Different provider entirely. Set JUDGE_PROVIDER="gemini" plus a
+#      GOOGLE_API_KEY (free from aistudio.google.com) and scoring moves to
+#      Gemini via DeepEval's native GeminiModel, leaving the Groq account to do
+#      nothing but answer questions.
+#
+# JUDGE_PROVIDER is required rather than inferred from the key's presence, and
+# that is a deliberate correction: an earlier version switched automatically on
+# finding GOOGLE_API_KEY or GEMINI_API_KEY, which meant an unrelated Google
+# credential already exported on the host - a very common thing to have - would
+# silently take over scoring and fail with an error pointing nowhere near the
+# cause. Provider selection is now something you state, not something the
+# environment decides for you.
+JUDGE_PROVIDER = (os.environ.get("JUDGE_PROVIDER") or "groq").strip().lower()
+
+GROQ_JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "openai/gpt-oss-20b")
+
+# gpt-oss models bill reasoning tokens like output tokens. Kept low because
+# DeepEval never asks the judge an open question - it asks "is this one
+# statement supported, yes or no?" a dozen times, which is classification, not
+# deliberation. Sent only to models that accept the field (see _chat).
+JUDGE_REASONING_EFFORT = os.environ.get("JUDGE_REASONING_EFFORT", "low")
+GEMINI_JUDGE_MODEL = os.environ.get("GEMINI_JUDGE_MODEL", "gemini-2.5-flash-lite")
+
+USE_GEMINI_JUDGE = JUDGE_PROVIDER == "gemini"
+
+# Read only once Gemini has been explicitly asked for, so a stray Google
+# credential in the environment cannot influence anything.
+_GOOGLE_KEY = (
+    (_secret("GOOGLE_API_KEY") or _secret("GEMINI_API_KEY"))
+    if USE_GEMINI_JUDGE
+    else None
+)
+
+# What the UI reports as the evaluation model. Resolved here rather than
+# hardcoded so the footer names the model that actually did the judging.
+JUDGE_MODEL = GEMINI_JUDGE_MODEL if USE_GEMINI_JUDGE else GROQ_JUDGE_MODEL
+
+# The single biggest lever on cost. DeepEval resends the retrieval context on
+# most of its sub-calls, so unlike the old one-shot judge - where the context
+# was sent exactly once - every extra character here is paid for a dozen times
+# over. Measured: 6x4000 costs ~29.5k tokens per scored answer, 3x1500 costs
+# ~10k. Three reranked chunks is where the answer's claims come from anyway.
+MAX_CONTEXTS = 3
+MAX_CONTEXT_CHARS = 1500
 
 # DeepEval decomposes each metric into several small LLM calls, so six metrics
-# is well over a dozen Groq requests per answer. Running them concurrently
-# keeps the wall-clock near the slowest single metric instead of their sum;
-# capping the pool keeps a free-tier key from tripping a 429 on every answer.
-# Lower it (2, or 1 for fully serial) if rate limits bite.
-MAX_PARALLEL_METRICS = int(os.environ.get("DEEPEVAL_MAX_WORKERS", "3"))
+# is well over a dozen Groq requests per answer. Serial by default: the binding
+# free-tier constraint is tokens per MINUTE (8k on the judge model), and
+# running metrics concurrently spends the same tokens in a shorter window,
+# which is precisely what trips a 429. Raise it to 2-3 on a paid tier, where
+# the wall-clock win is real and the TPM ceiling is not in reach.
+MAX_PARALLEL_METRICS = int(os.environ.get("DEEPEVAL_MAX_WORKERS", "1"))
 
-# Retries for a single judge call, for 429s and transient 5xxs. Exponential:
-# 2s, 4s, 8s.
+# Retries for a single judge call. Tuned for a per-minute token limit, which
+# is what a free-tier burst actually hits: 5s, 15s, 45s, rather than the 2/4/8
+# that expires long before a TPM window rolls over. A per-DAY exhaustion is
+# not retried at all - see _chat.
 MAX_RETRIES = 3
+RETRY_BACKOFF = (5, 15, 45)
 
 # (json key, UI label, "higher" | "lower", needs_reference)
 # `needs_reference` marks the metrics DeepEval cannot compute without an
@@ -153,16 +242,20 @@ def _get_client() -> Groq:
     global _client
     with _client_lock:
         if _client is None:
-            api_key = os.environ.get("GROQ_API_KEY")
+            api_key = _secret("GROQ_API_KEY")
             if not api_key:
-                try:
-                    import streamlit as st
-
-                    api_key = st.secrets["GROQ_API_KEY"]
-                except Exception:
-                    raise RuntimeError("GROQ_API_KEY is not configured")
+                raise RuntimeError("GROQ_API_KEY is not configured")
             _client = Groq(api_key=api_key)
     return _client
+
+
+def _is_daily_exhaustion(e: Exception) -> bool:
+    """A per-day limit and a per-minute limit are both 429s, and treating them
+    the same is a mistake: a TPM burst clears in under a minute and is worth
+    waiting out, while a TPD exhaustion clears at midnight UTC and no amount of
+    backoff will help. Retrying the latter just makes the user stare at a
+    spinner for a minute before seeing the same failure."""
+    return "per day" in str(e).lower() or "(tpd)" in str(e).lower()
 
 
 def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int) -> str:
@@ -173,18 +266,25 @@ def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int) -> str:
     for attempt in range(MAX_RETRIES):
         try:
             response = _get_client().chat.completions.create(
-                model=JUDGE_MODEL,
+                model=GROQ_JUDGE_MODEL,
                 messages=messages,
                 temperature=0,
                 max_tokens=max_tokens,
                 **({"response_format": {"type": "json_object"}} if json_mode else {}),
+                # gpt-oss only; other models reject it as an unknown field,
+                # which keeps JUDGE_MODEL free to point anywhere on Groq.
+                **(
+                    {"reasoning_effort": JUDGE_REASONING_EFFORT}
+                    if "gpt-oss" in GROQ_JUDGE_MODEL
+                    else {}
+                ),
             )
             return response.choices[0].message.content or ""
         except Exception as e:  # noqa: BLE001 - retried below, re-raised at the end
             last = e
-            if attempt == MAX_RETRIES - 1:
+            if _is_daily_exhaustion(e) or attempt == MAX_RETRIES - 1:
                 break
-            time.sleep(2 ** (attempt + 1))
+            time.sleep(RETRY_BACKOFF[attempt])
     raise last  # type: ignore[misc]
 
 
@@ -192,11 +292,33 @@ def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int) -> str:
 # The DeepEval judge model
 # ---------------------------------------------------------------------------
 def _build_judge():
-    """DeepEval ships no Groq provider, so the judge is a DeepEvalBaseLLM over
-    the `groq` client the app already uses. Defined inside a function so that
-    `import llm_metrics` costs nothing and cannot fail: deepeval is imported
-    lazily, and if it is missing the app still boots and reports it in the UI
-    rather than dying at import time."""
+    """The model DeepEval scores with - Gemini if a Google key is configured,
+    otherwise Groq.
+
+    Gemini is used through DeepEval's own GeminiModel, which is already wired
+    for structured output. Groq has no DeepEval provider, so that path is a
+    DeepEvalBaseLLM over the `groq` client the app already uses.
+
+    Defined inside a function so that `import llm_metrics` costs nothing and
+    cannot fail: deepeval is imported lazily, and if it is missing the app
+    still boots and reports it in the UI rather than dying at import time."""
+    if USE_GEMINI_JUDGE:
+        from deepeval.models import GeminiModel
+
+        if not _GOOGLE_KEY:
+            # Named explicitly rather than falling back to Groq: a silent
+            # fallback would spend the answer model's quota under a config
+            # that says it should not be, and the numbers in the UI would
+            # credit the wrong model.
+            raise RuntimeError(
+                'JUDGE_PROVIDER is "gemini" but no GOOGLE_API_KEY is set. '
+                "Add one (free at https://aistudio.google.com/apikey), or "
+                'remove JUDGE_PROVIDER to score on Groq.'
+            )
+        return GeminiModel(
+            model=GEMINI_JUDGE_MODEL, api_key=_GOOGLE_KEY, temperature=0
+        )
+
     from deepeval.models import DeepEvalBaseLLM
     from pydantic import BaseModel
 
@@ -317,7 +439,11 @@ def _build_metrics(judge, has_reference: bool) -> dict:
     common = dict(model=judge, threshold=0.7, include_reason=True, async_mode=False)
 
     built = {
-        "faithfulness": FaithfulnessMetric(**common),
+        # truths_extraction_limit caps how many facts are pulled out of the
+        # contexts before claims are checked against them. Uncapped, that list
+        # grows with context length and is resent on the verdict call, which is
+        # the single most expensive prompt in the whole pass.
+        "faithfulness": FaithfulnessMetric(truths_extraction_limit=15, **common),
         "answer_relevancy": AnswerRelevancyMetric(**common),
     }
     if has_reference:
@@ -409,7 +535,20 @@ to answer, say so plainly instead of guessing. Plain text only, no preamble, \
 no JSON, 2-5 sentences."""
 
 
-def _synthesize_reference(question: str, contexts: list[str]) -> str | None:
+def _generate_text(judge, prompt: str) -> str:
+    """Plain text out of whichever judge is configured.
+
+    DeepEval's own providers report their spend, so GeminiModel.generate
+    returns a (text, cost) tuple while our GroqJudge returns a bare string.
+    DeepEval unwraps that internally for metrics; anything of ours that calls
+    the judge directly has to do it here."""
+    result = judge.generate(prompt)
+    if isinstance(result, tuple):
+        result = result[0]
+    return str(result or "")
+
+
+def _synthesize_reference(judge, question: str, contexts: list[str]) -> str | None:
     """Drafts a reference answer from ONLY the question and contexts, in a call
     that never sees the system's actual answer. DeepEval needs an
     `expected_output` for four of the six metrics and a live chat question has
@@ -417,21 +556,20 @@ def _synthesize_reference(question: str, contexts: list[str]) -> str | None:
     the point - a reference drafted while looking at the real answer just
     measures self-agreement.
 
+    Runs on the judge rather than a direct Groq call so that every token spent
+    evaluating lands on the evaluation provider. Otherwise configuring a Gemini
+    judge would still quietly bill this call to Groq, which is the exact
+    cross-contamination the split exists to prevent.
+
     Returns None (never raises) on any failure, so a bad synthesis call costs
     the four reference-based metrics, not the whole score.
     """
     context_block = "\n\n".join(f"[Context {i}]\n{c}" for i, c in enumerate(contexts, 1))
     try:
-        text = _chat(
-            [
-                {"role": "system", "content": _SYNTHESIS_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"QUESTION\n{question.strip()}\n\nCONTEXTS\n{context_block}",
-                },
-            ],
-            json_mode=False,
-            max_tokens=300,
+        text = _generate_text(
+            judge,
+            f"{_SYNTHESIS_SYSTEM_PROMPT}\n\n"
+            f"QUESTION\n{question.strip()}\n\nCONTEXTS\n{context_block}",
         )
         return text.strip() or None
     except Exception:
@@ -474,15 +612,26 @@ def score_answer(
         # there is nothing meaningful to score.
         return JudgeScores(error="nothing to score")
 
-    reference = (reference or "").strip()
-    if not reference:
-        reference = _synthesize_reference(question, contexts) or ""
-    has_reference = bool(reference)
-
+    # The judge is built before the reference is synthesized because synthesis
+    # now runs on it (see _synthesize_reference). A missing key or a missing
+    # deepeval is therefore reported here, once, instead of surfacing as a
+    # mysteriously absent reference later.
     try:
         from deepeval.test_case import LLMTestCase
 
         judge = _build_judge()
+    except Exception as e:  # noqa: BLE001 - deepeval missing, or no API key
+        # Includes the message, not just the exception type: a bare
+        # "ModuleNotFoundError" with no module name is impossible to diagnose
+        # from the UI.
+        return JudgeScores(error=f"{type(e).__name__}: {e}"[:200])
+
+    reference = (reference or "").strip()
+    if not reference:
+        reference = _synthesize_reference(judge, question, contexts) or ""
+    has_reference = bool(reference)
+
+    try:
         metrics = _build_metrics(judge, has_reference)
         test_case = LLMTestCase(
             input=question.strip(),
@@ -490,11 +639,11 @@ def score_answer(
             retrieval_context=contexts,
             expected_output=reference or None,
         )
-    except Exception as e:  # noqa: BLE001 - deepeval missing, or no API key
-        # Includes the message, not just the exception type: a bare
-        # "ModuleNotFoundError" with no module name is impossible to diagnose
-        # from the UI.
-        return JudgeScores(error=f"{type(e).__name__}: {e}"[:200])
+    except Exception as e:  # noqa: BLE001 - a deepeval version mismatch
+        # Separate from the judge-construction failure above so the UI can tell
+        # "could not reach the judge" apart from "this deepeval version renamed
+        # something", which are fixed in completely different places.
+        return JudgeScores(error=f"metric setup failed - {type(e).__name__}: {e}"[:200])
 
     scores, reasons, failures = _measure_all(metrics, test_case)
 
