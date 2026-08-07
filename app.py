@@ -339,7 +339,8 @@ with st.sidebar:
         key="score_answers",
         help="Scores all six RAG metrics on each reply with DeepEval. Each "
              "metric runs its own extraction and verdict calls, so this adds "
-             "a few seconds per question.",
+             "a few seconds per question and is the main consumer of your "
+             "judge model's daily token allowance.",
     )
 
 
@@ -493,7 +494,7 @@ def render_answer_scores(scores: dict | None):
             if val is None:
                 continue
             # Every metric is defined on 0-1; clamp anyway so an out-of-range
-            # value from the judge can't blow the bar past its track.
+            # value can't blow the bar past its track.
             pct = max(0.0, min(1.0, val)) * 100
             hint = "lower is better" if direction == "lower" else "higher is better"
             reason = reasons.get(key)
@@ -708,6 +709,11 @@ def render_evaluation():
             'Precision, Context Recall, Context Entity Recall and Answer '
             'Correctness are measured against a human-written reference rather '
             'than a synthesized one &mdash; which a live question cannot offer.',
+            'The chips under each reply score that reply alone, against a '
+            'reference synthesized from its own retrieved context. These numbers '
+            'are the whole system measured against fixed questions with '
+            'human-written answers, which is what makes them comparable across '
+            'changes to chunking, reranking or prompting.',
         ]
         parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
         st.markdown("".join(parts), unsafe_allow_html=True)
@@ -818,12 +824,12 @@ if query:
 
             render_sources(sources)
 
-            # Scored only after the answer is on screen, so the judge call
-            # never delays the reply itself. Stored on the message so
+            # Scored only after the answer is on screen, so DeepEval's calls
+            # never delay the reply itself. Stored on the message so
             # Streamlit's reruns replay it instead of re-billing.
             scores = None
             if st.session_state.get("score_answers", True) and chunks:
-                with st.spinner("Scoring this answer..."):
+                with st.spinner("Scoring this answer with DeepEval..."):
                     scores = score_answer(
                         question=query,
                         contexts=[c["text"] for c in chunks],
