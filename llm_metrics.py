@@ -1,73 +1,77 @@
 """
-PhotonX RAG - per-answer RAGAS-style scoring via a single judge-LLM prompt
---------------------------------------------------------------------------
-Replaces the previous `ragas` + `datasets` + `langchain-groq` stack. That
-stack was the reason the deployed app printed "ragas unavailable
-(ModuleNotFoundError)": those packages pull ~2GB of transitive dependencies
-into a Streamlit Community Cloud container that cannot hold them, so the pip
-install failed while the app itself still booted.
+PhotonX RAG - per-answer scoring via DeepEval
+---------------------------------------------
+Replaces the previous hand-rolled judge-LLM prompt. That approach asked one
+Groq call to invent six numbers in a single JSON blob: the "counts" it quoted
+were never verified, nothing forced the claim decomposition to actually
+happen, and a model in a good mood returned 0.9s across the board. It was a
+prompt pretending to be a metric.
 
-Everything here runs on `groq`, which the app already depends on for answer
-generation. Zero new packages, nothing to install, nothing that can go
-missing at import time.
+Everything here is computed by DeepEval (https://deepeval.com), which
+implements each metric as a fixed, published algorithm - statement extraction,
+per-statement verdicts, then arithmetic in Python over those verdicts. The LLM
+is only ever asked small, checkable classification questions; DeepEval does
+the counting, not the model. That is the difference between a measurement and
+an opinion.
 
 WHAT IS MEASURED
 ----------------
-One judge call scores the metrics RAGAS reports, from the same
-(question, retrieved_contexts, answer) triple the user just produced:
+Same six metrics the UI has always shown, now each backed by a DeepEval
+implementation:
 
-  Faithfulness          higher better - claims in the answer traceable to context
-  Answer Relevancy      higher better - answer actually addresses the question
-  Context Precision     higher better - retrieved contexts that were worth retrieving
-  Context Recall        higher better - needed information the context actually contains
-  Context Entity Recall higher better - entities in play that appear in the context
-  Answer Correctness    higher better - agreement with a known-correct answer
+  Faithfulness          FaithfulnessMetric         truths vs. claims in the answer
+  Answer Relevancy      AnswerRelevancyMetric      relevant statements / statements
+  Context Precision     ContextualPrecisionMetric  rank-weighted useful contexts
+  Context Recall        ContextualRecallMetric     reference sentences attributable
+  Context Entity Recall GEval                      reference entities present in context
+  Answer Correctness    GEval                      answer vs. reference agreement
+
+Four are native DeepEval RAG metrics. DeepEval has no built-in entity-recall
+metric, and "correctness" is by design a GEval metric there (it is the
+framework's documented pattern for it), so those two are defined as GEval
+metrics with explicit evaluation_steps. GEval is still a framework algorithm -
+the steps are fixed, the score comes out of DeepEval's own scoring - not a
+free-form "rate this 0-1" prompt.
 
 TWO MODES, AND THE DIFFERENCE MATTERS
 -------------------------------------
-`score_answer(...)` without a `reference` is the LIVE mode used for a real
-user's question in the chat. Faithfulness, Answer Relevancy and Context
-Precision are reference-free by definition and are measured as specified.
-Context Recall and Context Entity Recall are NOT reference-free in real
-RAGAS - they are defined against a human-written reference answer, which a
-live question does not have. In live mode the judge estimates them against
-"what a complete answer to this question would need to contain". Directional
-indicators, not the textbook metric.
+Four of the six metrics are defined against a REFERENCE answer, and DeepEval
+enforces that: ContextualPrecisionMetric and ContextualRecallMetric will not
+run without `expected_output`. Faithfulness and Answer Relevancy are
+reference-free by definition and always run.
 
-Answer Correctness genuinely cannot be estimated the same way: it exists to
-check the answer against ground truth, so scoring it against a reference
-drafted in the same breath as reading the actual answer just measures
-self-agreement, not correctness - the reference silently anchors to whatever
-answer it already saw. To make it meaningful in live mode too, score_answer
-makes ONE EXTRA judge call first (_synthesize_reference) that drafts a
-reference answer from ONLY the question and contexts - it is never shown the
-system's actual answer, so it can't be contaminated by it. That blind
-reference is then used exactly like a human-written one for scoring. This
-costs one extra Groq round-trip per live question; every other metric's
-definition and behavior is unchanged from before this existed.
+`score_answer(..., reference="...")` is BENCHMARK mode, used by evaluate.py
+over eval_dataset.json, where a human-written reference exists.
 
-`score_answer(..., reference="...")` is the BENCHMARK mode used by
-evaluate.py over eval_dataset.json. A human-written reference already exists
-there, so the blind-synthesis call is skipped entirely and the reference is
-used directly - same scoring logic either way once a reference exists.
+`score_answer(...)` without one is LIVE mode - a real user question in the
+chat, which has no reference. As before, one extra Groq call
+(_synthesize_reference) drafts a reference from ONLY the question and the
+retrieved contexts. It never sees the system's actual answer, so it cannot
+anchor to it, and the resulting reference is then handed to DeepEval exactly
+like a human-written one. If that call fails, scoring degrades to the two
+reference-free metrics rather than failing outright.
 
-The prompt forces the judge to enumerate and count (claims supported / claims
-total) rather than emit a gut-feel number. That is what keeps a single LLM
-call behaving like a metric instead of a mood ring, and it is why every score
-comes back with the counts that produced it.
-
-Fail-safe by construction: any failure - missing key, rate limit, malformed
-JSON - returns a JudgeScores carrying an `error` string. It never raises into
-the chat flow, because a broken score must not cost the user their answer.
+Fail-safe by construction: any failure - missing key, rate limit, deepeval not
+installed, one metric erroring - is contained. A metric that fails is dropped
+from the result; only a total failure produces an `error` string. It never
+raises into the chat flow, because a broken score must not cost the user their
+answer.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+
+# Must be set before `deepeval` is first imported. DeepEval otherwise phones
+# home on import (analytics + a version check) and prints an update banner into
+# the Streamlit server log on every rerun.
+os.environ.setdefault("DEEPEVAL_TELEMETRY_OPT_OUT", "YES")
+os.environ.setdefault("ERROR_REPORTING", "NO")
+os.environ.setdefault("DEEPEVAL_UPDATE_WARNING_OPT_OUT", "YES")
 
 from groq import Groq
 
@@ -76,22 +80,33 @@ from groq import Groq
 # without touching the answer path.
 JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "llama-3.3-70b-versatile")
 
-# Long contexts make the judge call slow and push it toward the token ceiling.
-# Faithfulness only needs enough context to verify the answer's claims.
+# Long contexts make every metric slower and push the judge toward its token
+# ceiling. Faithfulness only needs enough context to verify the claims.
 MAX_CONTEXTS = 6
 MAX_CONTEXT_CHARS = 4000
 
+# DeepEval decomposes each metric into several small LLM calls, so six metrics
+# is well over a dozen Groq requests per answer. Running them concurrently
+# keeps the wall-clock near the slowest single metric instead of their sum;
+# capping the pool keeps a free-tier key from tripping a 429 on every answer.
+# Lower it (2, or 1 for fully serial) if rate limits bite.
+MAX_PARALLEL_METRICS = int(os.environ.get("DEEPEVAL_MAX_WORKERS", "3"))
+
+# Retries for a single judge call, for 429s and transient 5xxs. Exponential:
+# 2s, 4s, 8s.
+MAX_RETRIES = 3
+
 # (json key, UI label, "higher" | "lower", needs_reference)
-# `needs_reference` metrics need an actual REFERENCE to be scored - human
-# (benchmark mode) or blind-synthesized (live mode, see _synthesize_reference
-# below). Either way the metric is only meaningful once a real reference
-# exists to compare against; it is never scored against thin air.
+# `needs_reference` marks the metrics DeepEval cannot compute without an
+# `expected_output`. In live mode that reference is blind-synthesized (see
+# _synthesize_reference); either way the metric is only scored once a real
+# reference string exists, never against thin air.
 METRICS: tuple[tuple[str, str, str, bool], ...] = (
     ("faithfulness", "Faithfulness", "higher", False),
     ("answer_relevancy", "Answer Relevancy", "higher", False),
-    ("context_precision", "Context Precision", "higher", False),
-    ("context_recall", "Context Recall", "higher", False),
-    ("context_entity_recall", "Context Entity Recall", "higher", False),
+    ("context_precision", "Context Precision", "higher", True),
+    ("context_recall", "Context Recall", "higher", True),
+    ("context_entity_recall", "Context Entity Recall", "higher", True),
     ("answer_correctness", "Answer Correctness", "higher", True),
 )
 
@@ -100,118 +115,14 @@ LIVE_METRICS = tuple(m for m in METRICS if not m[3])
 
 def metrics_for(has_reference: bool) -> tuple[tuple[str, str, str, bool], ...]:
     """The metric table applicable to one scoring mode. `has_reference` is
-    True whenever a REFERENCE will actually be given to the judge - whether
+    True whenever a REFERENCE will actually be given to DeepEval - whether
     it's human-written (benchmark mode) or blind-synthesized (live mode)."""
     return METRICS if has_reference else LIVE_METRICS
 
 
-_PROMPT_HEAD = """\
-You are a strict RAG evaluation judge. You score one retrieval-augmented answer \
-on {n} metrics and reply with JSON only.
-
-Score every metric by COUNTING, never by impression. For each metric, first \
-identify the discrete items it is defined over, then count how many qualify, \
-then divide. Report both counts alongside the score so the arithmetic is \
-checkable. If a metric has zero items to count, set its score to null and say \
-why in its reason.
-
-METRIC DEFINITIONS - follow these exactly.
-
-1. faithfulness (higher is better)
-   Break the ANSWER into atomic factual claims. A claim is supported if it can \
-be inferred from the CONTEXTS alone. Do not use outside knowledge - a claim \
-that is true in the real world but absent from the contexts is UNSUPPORTED.
-   score = supported_claims / total_claims
-
-2. answer_relevancy (higher is better)
-   Break the ANSWER into statements. A statement is relevant if it addresses \
-the QUESTION as asked. Padding, hedging, restating the question, and correct \
-but off-topic detail are all irrelevant. If the answer leaves a directly asked \
-sub-question unaddressed, cap the score at 0.7.
-   score = relevant_statements / total_statements
-
-3. context_precision (higher is better)
-   The CONTEXTS are given best-first, in the order the retriever ranked them. \
-A context is useful if it contributed information a correct answer to the \
-QUESTION needs. Weight earlier ranks more heavily: a useless context at rank 1 \
-costs more than a useless one at the last rank.
-   score = rank-weighted useful_contexts / total_contexts
-"""
-
-# Live mode: no human reference exists, so recall is judged against the
-# judge's own reconstruction of what a complete answer would need. Unchanged
-# from the original design - answer_correctness is deliberately NOT defined
-# here, because it is only ever scored once a real reference exists (see
-# _synthesize_reference + _DEFS_REFERENCE_BASED below).
-_DEFS_REFERENCE_FREE = """\
-4. context_recall (higher is better)
-   There is no reference answer. Infer what a complete, correct answer to the \
-QUESTION would have to state, as a list of required points. A point is covered \
-if the CONTEXTS contain it.
-   score = covered_points / required_points
-
-5. context_entity_recall (higher is better)
-   List the specific entities the QUESTION and ANSWER turn on - proper nouns, \
-product and service names, organisations, figures, dates. Generic words are not \
-entities. An entity is present if it appears in the CONTEXTS.
-   score = entities_present / entities_total
-"""
-
-# Benchmark mode: a REFERENCE is supplied, so recall is measured against it as
-# RAGAS defines it, and correctness becomes measurable.
-_DEFS_REFERENCE_BASED = """\
-4. context_recall (higher is better)
-   Break the REFERENCE into atomic claims. A claim is attributable if the \
-CONTEXTS contain it. This measures retrieval, not the answer - ignore the \
-ANSWER entirely for this metric.
-   score = attributable_reference_claims / total_reference_claims
-
-5. context_entity_recall (higher is better)
-   List the specific entities in the REFERENCE - proper nouns, product and \
-service names, organisations, figures, dates. Generic words are not entities. \
-An entity is present if it appears in the CONTEXTS.
-   score = reference_entities_present_in_contexts / reference_entities_total
-
-6. answer_correctness (higher is better)
-   Compare the ANSWER against the REFERENCE. Classify every claim as TP (in \
-both), FP (in the answer, absent from or contradicting the reference), or FN \
-(required by the reference, missing from the answer). Wording may differ freely \
-- judge meaning, not phrasing.
-   score = TP / (TP + 0.5 * (FP + FN))
-   If the REFERENCE states the documents cannot answer the question, then a \
-correct ANSWER is one that declines to answer; an answer that confidently \
-states facts anyway scores 0.0.
-"""
-
-_PROMPT_TAIL = """\
-Reply with this JSON object and nothing else. Every "score" is a number from \
-0.0 to 1.0, or null. Every "reason" is one sentence, under 25 words, and must \
-cite the counts.
-
-{{
-{lines}
-}}
-"""
-
-
-def _build_system_prompt(has_reference: bool) -> str:
-    table = metrics_for(has_reference)
-    width = max(len(k) for k, _, _, _ in table) + 3
-    lines = ",\n".join(
-        f'  {(chr(34) + k + chr(34) + ":"):<{width}} {{"score": 0.0, "reason": ""}}'
-        for k, _, _, _ in table
-    )
-    return (
-        _PROMPT_HEAD.format(n=len(table))
-        + (_DEFS_REFERENCE_BASED if has_reference else _DEFS_REFERENCE_FREE)
-        + "\n"
-        + _PROMPT_TAIL.format(lines=lines)
-    )
-
-
 @dataclass
 class JudgeScores:
-    """`error` is set instead of the scores when anything goes wrong; callers
+    """`error` is set instead of the scores when everything goes wrong; callers
     render whichever is populated and never have to handle an exception."""
 
     scores: dict[str, float] = field(default_factory=dict)
@@ -228,13 +139,17 @@ class JudgeScores:
         return {"scores": self.scores, "reasons": self.reasons, "error": self.error}
 
 
+# ---------------------------------------------------------------------------
+# Groq client
+# ---------------------------------------------------------------------------
 _client_lock = threading.Lock()
 _client: Groq | None = None
 
 
 def _get_client() -> Groq:
     """One Groq client for the process. Streamlit reruns the script on every
-    interaction, so building this per call would churn HTTP clients."""
+    interaction, so building this per call would churn HTTP clients - and
+    DeepEval fans out across threads, which would multiply that."""
     global _client
     with _client_lock:
         if _client is None:
@@ -250,51 +165,242 @@ def _get_client() -> Groq:
     return _client
 
 
-def _trim(contexts: list[str]) -> list[str]:
-    out = []
-    for c in contexts[:MAX_CONTEXTS]:
-        c = (c or "").strip()
-        if c:
-            out.append(c[:MAX_CONTEXT_CHARS])
-    return out
-
-
-def _coerce_score(raw) -> float | None:
-    """The judge is told to emit numbers, but models occasionally return
-    "0.85", "85%", or a bare "null". Accept what is unambiguous, clamp to the
-    0-1 range every metric is defined on, reject the rest."""
-    if raw is None or isinstance(raw, bool):
-        return None
-    if isinstance(raw, str):
-        m = re.search(r"-?\d+(?:\.\d+)?", raw)
-        if not m:
-            return None
-        val = float(m.group(0))
-        if "%" in raw and val > 1:
-            val /= 100.0
-    else:
+def _chat(messages: list[dict], *, json_mode: bool, max_tokens: int) -> str:
+    """One Groq completion, retried on rate limits. Judging must be
+    reproducible, hence temperature=0: the same triple should not score
+    differently on a rerun."""
+    last: Exception | None = None
+    for attempt in range(MAX_RETRIES):
         try:
-            val = float(raw)
-        except (TypeError, ValueError):
-            return None
-    if val != val:  # NaN
-        return None
-    return max(0.0, min(1.0, val))
+            response = _get_client().chat.completions.create(
+                model=JUDGE_MODEL,
+                messages=messages,
+                temperature=0,
+                max_tokens=max_tokens,
+                **({"response_format": {"type": "json_object"}} if json_mode else {}),
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:  # noqa: BLE001 - retried below, re-raised at the end
+            last = e
+            if attempt == MAX_RETRIES - 1:
+                break
+            time.sleep(2 ** (attempt + 1))
+    raise last  # type: ignore[misc]
 
 
-def _parse_judge_json(content: str) -> dict:
-    """JSON mode makes a clean object overwhelmingly likely, but a model that
-    wraps it in prose or a ```json fence would otherwise throw away a paid
-    call, so fall back to the outermost braces."""
+# ---------------------------------------------------------------------------
+# The DeepEval judge model
+# ---------------------------------------------------------------------------
+def _build_judge():
+    """DeepEval ships no Groq provider, so the judge is a DeepEvalBaseLLM over
+    the `groq` client the app already uses. Defined inside a function so that
+    `import llm_metrics` costs nothing and cannot fail: deepeval is imported
+    lazily, and if it is missing the app still boots and reports it in the UI
+    rather than dying at import time."""
+    from deepeval.models import DeepEvalBaseLLM
+    from pydantic import BaseModel
+
+    class GroqJudge(DeepEvalBaseLLM):
+        """DeepEval hands each metric's sub-prompt here and, for every step
+        that matters, a Pydantic `schema` it needs back. Returning a validated
+        instance of that schema is the whole contract - it is what lets
+        DeepEval do the counting in Python instead of trusting a number the
+        model wrote."""
+
+        def __init__(self, model_name: str = JUDGE_MODEL):
+            self.model_name = model_name
+            super().__init__(model_name)
+
+        def load_model(self):
+            return _get_client()
+
+        def get_model_name(self) -> str:
+            return self.model_name
+
+        def generate(self, prompt: str, schema: type[BaseModel] | None = None):
+            if schema is None:
+                return _chat(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=False,
+                    max_tokens=1500,
+                )
+
+            # Groq's JSON mode guarantees syntactically valid JSON but not the
+            # right shape, so the shape is stated in the prompt and enforced by
+            # Pydantic on the way back. One repair attempt: a near-miss is
+            # cheap to fix and expensive to throw away.
+            instruction = (
+                f"{prompt}\n\n"
+                "Respond with a single JSON object and nothing else. It must "
+                "validate against this JSON schema:\n"
+                f"{schema.model_json_schema()}"
+            )
+            messages = [{"role": "user", "content": instruction}]
+            for attempt in range(2):
+                raw = _chat(messages, json_mode=True, max_tokens=2000)
+                try:
+                    return schema.model_validate_json(raw)
+                except Exception as e:  # noqa: BLE001 - retried once, then raised
+                    if attempt:
+                        raise
+                    messages = messages + [
+                        {"role": "assistant", "content": raw},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"That JSON failed schema validation: {e}. "
+                                "Return the corrected JSON object only."
+                            ),
+                        },
+                    ]
+
+        async def a_generate(self, prompt: str, schema: type[BaseModel] | None = None):
+            # Metrics run with async_mode=False and are parallelised across
+            # threads instead (see _measure_all), so this is only here to
+            # satisfy the abstract base class.
+            return self.generate(prompt, schema=schema)
+
+    return GroqJudge()
+
+
+# ---------------------------------------------------------------------------
+# Metric construction
+# ---------------------------------------------------------------------------
+_ENTITY_RECALL_STEPS = [
+    "List every specific entity in 'expected output': proper nouns, product "
+    "and service names, organisation names, technologies, figures, and dates. "
+    "Generic words are not entities.",
+    "For each entity, check whether it appears in 'retrieval context', either "
+    "verbatim or as an unambiguous variant of the same thing.",
+    "The score is the number of entities found in 'retrieval context' divided "
+    "by the total number of entities listed.",
+    "Judge only entity presence in the retrieval context. Ignore the wording, "
+    "fluency, and completeness of any answer.",
+    "If 'expected output' contains no entities at all, return a score of 1.",
+]
+
+_CORRECTNESS_STEPS = [
+    "Compare 'actual output' against 'expected output' and classify every "
+    "factual claim as: present in both, present in the actual output but "
+    "absent from or contradicting the expected output, or required by the "
+    "expected output but missing from the actual output.",
+    "Penalise contradictions of the expected output most heavily; penalise "
+    "omissions of required information next.",
+    "Wording, ordering, and level of detail may differ freely - judge meaning, "
+    "not phrasing.",
+    "If 'expected output' states that the documents cannot answer the "
+    "question, then a correct 'actual output' is one that declines to answer; "
+    "an actual output that confidently states facts anyway scores 0.",
+]
+
+
+def _build_metrics(judge, has_reference: bool) -> dict:
+    """One fresh metric instance per key. Fresh per call, not cached: DeepEval
+    metrics carry the last run's verdicts, score and reason on the instance, so
+    reusing one across answers would leak state between them."""
+    from deepeval.metrics import (
+        AnswerRelevancyMetric,
+        ContextualPrecisionMetric,
+        ContextualRecallMetric,
+        FaithfulnessMetric,
+        GEval,
+    )
+
+    try:  # renamed in deepeval 4.1; the old name still works but warns
+        from deepeval.test_case import SingleTurnParams as Params
+    except ImportError:  # pragma: no cover - older deepeval
+        from deepeval.test_case import LLMTestCaseParams as Params
+
+    # async_mode=False on every metric: DeepEval's async path drives its own
+    # event loop, which fights Streamlit's script-rerun threading. Concurrency
+    # comes from the thread pool in _measure_all instead.
+    common = dict(model=judge, threshold=0.7, include_reason=True, async_mode=False)
+
+    built = {
+        "faithfulness": FaithfulnessMetric(**common),
+        "answer_relevancy": AnswerRelevancyMetric(**common),
+    }
+    if has_reference:
+        built["context_precision"] = ContextualPrecisionMetric(**common)
+        built["context_recall"] = ContextualRecallMetric(**common)
+        built["context_entity_recall"] = GEval(
+            name="Context Entity Recall",
+            evaluation_steps=_ENTITY_RECALL_STEPS,
+            evaluation_params=[
+                Params.INPUT,
+                Params.EXPECTED_OUTPUT,
+                Params.RETRIEVAL_CONTEXT,
+            ],
+            model=judge,
+            threshold=0.7,
+            async_mode=False,
+        )
+        built["answer_correctness"] = GEval(
+            name="Answer Correctness",
+            evaluation_steps=_CORRECTNESS_STEPS,
+            evaluation_params=[
+                Params.INPUT,
+                Params.ACTUAL_OUTPUT,
+                Params.EXPECTED_OUTPUT,
+            ],
+            model=judge,
+            threshold=0.7,
+            async_mode=False,
+        )
+    return built
+
+
+def _measure(metric, test_case) -> None:
+    """`_show_indicator` suppresses DeepEval's rich spinner, which would
+    otherwise scribble ANSI escapes into the Streamlit server log once per
+    metric. Both flags are private to DeepEval, so a version that drops them
+    falls back to the plain call rather than breaking scoring."""
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        start, end = content.find("{"), content.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        return json.loads(content[start : end + 1])
+        metric.measure(test_case, _show_indicator=False, _log_metric_to_confident=False)
+    except TypeError:
+        metric.measure(test_case)
 
 
+def _measure_all(metrics: dict, test_case) -> tuple[dict, dict, list[str]]:
+    """Run every metric over the one test case and collect what succeeded.
+
+    A metric that fails is dropped and its failure recorded, never raised: one
+    rate-limited sub-call must not cost the other five metrics their scores.
+    """
+    scores: dict[str, float] = {}
+    reasons: dict[str, str] = {}
+    failures: list[str] = []
+
+    workers = max(1, min(MAX_PARALLEL_METRICS, len(metrics)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            key: pool.submit(_measure, metric, test_case)
+            for key, metric in metrics.items()
+        }
+        for key, future in futures.items():
+            try:
+                future.result()
+            except Exception as e:  # noqa: BLE001 - one metric down, not all six
+                failures.append(f"{key}: {type(e).__name__}")
+                continue
+            metric = metrics[key]
+            score = getattr(metric, "score", None)
+            if score is None:
+                failures.append(f"{key}: no score")
+                continue
+            # Every metric is defined on 0-1; clamp so an out-of-range value
+            # can't reach the UI's progress bars.
+            scores[key] = max(0.0, min(1.0, float(score)))
+            reason = (getattr(metric, "reason", None) or "").strip()
+            if reason:
+                reasons[key] = reason
+
+    return scores, reasons, failures
+
+
+# ---------------------------------------------------------------------------
+# Reference synthesis (live mode only)
+# ---------------------------------------------------------------------------
 _SYNTHESIS_SYSTEM_PROMPT = """\
 You answer questions using ONLY the provided context. Write the single best, \
 complete, accurate answer to the QUESTION using only the CONTEXTS - as if you \
@@ -304,51 +410,63 @@ no JSON, 2-5 sentences."""
 
 
 def _synthesize_reference(question: str, contexts: list[str]) -> str | None:
-    """Drafts a reference answer from ONLY the question and contexts, in a
-    call that never sees the system's actual answer. This blind separation is
-    the whole point: a reference drafted in the same call as scoring the real
-    answer silently anchors to whatever answer it already read, which is why
-    an earlier version of this scored answer_correctness near 1.0 regardless
-    of the question - it was measuring self-agreement, not correctness.
+    """Drafts a reference answer from ONLY the question and contexts, in a call
+    that never sees the system's actual answer. DeepEval needs an
+    `expected_output` for four of the six metrics and a live chat question has
+    none; this supplies one without contaminating it. The blind separation is
+    the point - a reference drafted while looking at the real answer just
+    measures self-agreement.
+
     Returns None (never raises) on any failure, so a bad synthesis call costs
-    that one metric, not the rest of the scoring."""
+    the four reference-based metrics, not the whole score.
+    """
     context_block = "\n\n".join(f"[Context {i}]\n{c}" for i, c in enumerate(contexts, 1))
     try:
-        response = _get_client().chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[
+        text = _chat(
+            [
                 {"role": "system", "content": _SYNTHESIS_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": f"QUESTION\n{question.strip()}\n\nCONTEXTS\n{context_block}",
                 },
             ],
-            temperature=0,
+            json_mode=False,
             max_tokens=300,
         )
-        text = (response.choices[0].message.content or "").strip()
-        return text or None
+        return text.strip() or None
     except Exception:
         return None
 
 
+def _trim(contexts: list[str]) -> list[str]:
+    out = []
+    for c in contexts[:MAX_CONTEXTS]:
+        c = (c or "").strip()
+        if c:
+            out.append(c[:MAX_CONTEXT_CHARS])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 def score_answer(
     question: str,
     contexts: list[str],
     answer: str,
     reference: str | None = None,
 ) -> JudgeScores:
-    """Score one answer with a single judge-LLM call. Never raises.
+    """Score one answer with DeepEval. Never raises.
 
     Pass `reference` (a known-correct answer, as eval_dataset.json supplies) to
     use it directly for benchmark mode. Omit it for a live chat question and a
-    reference is drafted automatically via a separate, answer-blind judge call
-    (see _synthesize_reference) so Answer Correctness is still meaningful - if
-    that call fails for any reason, scoring falls back to the original 5
-    reference-free metrics rather than failing the whole score.
+    reference is drafted automatically via a separate, answer-blind call (see
+    _synthesize_reference) so the four reference-based metrics stay available -
+    if that call fails, scoring falls back to Faithfulness and Answer Relevancy
+    rather than failing the whole score.
 
-    Deliberately takes no embedder and no retrieval objects: the judge reads
-    text, so scoring is decoupled from the engine that produced the answer.
+    Deliberately takes no embedder and no retrieval objects: DeepEval reads
+    text, so scoring stays decoupled from the engine that produced the answer.
     """
     contexts = _trim(contexts)
     if not question.strip() or not answer.strip() or not contexts:
@@ -360,56 +478,28 @@ def score_answer(
     if not reference:
         reference = _synthesize_reference(question, contexts) or ""
     has_reference = bool(reference)
-    table = metrics_for(has_reference)
-
-    context_block = "\n\n".join(
-        f"[Context {i}, retrieval rank {i}]\n{c}" for i, c in enumerate(contexts, 1)
-    )
-    user_prompt = (
-        f"QUESTION\n{question.strip()}\n\n"
-        f"CONTEXTS ({len(contexts)} retrieved, best-first)\n{context_block}\n\n"
-        f"ANSWER\n{answer.strip()}\n\n"
-        + (f"REFERENCE (known-correct answer)\n{reference}\n\n" if has_reference else "")
-        + f"Score the {len(table)} metrics and reply with the JSON object."
-    )
 
     try:
-        response = _get_client().chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[
-                {"role": "system", "content": _build_system_prompt(has_reference)},
-                {"role": "user", "content": user_prompt},
-            ],
-            # Judging must be reproducible: the same triple should not score
-            # differently on a rerun.
-            temperature=0,
-            max_tokens=1000,
-            response_format={"type": "json_object"},
+        from deepeval.test_case import LLMTestCase
+
+        judge = _build_judge()
+        metrics = _build_metrics(judge, has_reference)
+        test_case = LLMTestCase(
+            input=question.strip(),
+            actual_output=answer.strip(),
+            retrieval_context=contexts,
+            expected_output=reference or None,
         )
-        payload = _parse_judge_json(response.choices[0].message.content or "{}")
-    except Exception as e:
-        # Includes the message, not just the exception type - the previous
-        # implementation reported only `ModuleNotFoundError` with no module
-        # name, which made the failure impossible to diagnose from the UI.
+    except Exception as e:  # noqa: BLE001 - deepeval missing, or no API key
+        # Includes the message, not just the exception type: a bare
+        # "ModuleNotFoundError" with no module name is impossible to diagnose
+        # from the UI.
         return JudgeScores(error=f"{type(e).__name__}: {e}"[:200])
 
-    scores: dict[str, float] = {}
-    reasons: dict[str, str] = {}
-    for key, _label, _direction, _needs_ref in table:
-        entry = payload.get(key)
-        if isinstance(entry, dict):
-            val = _coerce_score(entry.get("score"))
-            reason = str(entry.get("reason") or "").strip()
-        else:
-            # Tolerate a judge that flattened {"score": x} to a bare number.
-            val = _coerce_score(entry)
-            reason = ""
-        if val is not None:
-            scores[key] = val
-            if reason:
-                reasons[key] = reason
+    scores, reasons, failures = _measure_all(metrics, test_case)
 
     if not scores:
-        return JudgeScores(error="judge returned no usable scores")
+        detail = "; ".join(failures) or "no metric returned a score"
+        return JudgeScores(error=f"DeepEval scoring failed - {detail}"[:200])
 
     return JudgeScores(scores=scores, reasons=reasons)
