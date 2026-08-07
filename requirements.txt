@@ -7,12 +7,20 @@ tiktoken
 rank_bm25
 groq
 streamlit
+deepeval
 
-# Per-answer RAGAS-style scoring (llm_metrics.py) adds NO dependencies. It is
-# a single judge-LLM call over the `groq` client already listed above.
+# Per-answer scoring (llm_metrics.py) runs on `deepeval`, which implements each
+# metric as a published algorithm - statement extraction, per-statement
+# verdicts, then arithmetic in Python - instead of asking one LLM call to
+# invent six numbers.
 #
-# `ragas` and `langchain-groq` used to be here. They pull datasets + pyarrow +
-# langchain-core transitively, the install exceeded what a Streamlit Community
-# Cloud container will take, and pip failed while the app still booted - which
-# is exactly how the UI ended up printing "ragas unavailable
+# `ragas` + `datasets` + `langchain-groq` used to be here and were removed:
+# they pull pyarrow + langchain-core transitively, the install exceeded what a
+# Streamlit Community Cloud container will take, and pip failed while the app
+# still booted - which is how the UI ended up printing "ragas unavailable
 # (ModuleNotFoundError)" on every answer. Do not add them back.
+#
+# deepeval is not a re-run of that mistake: it is pure Python apart from
+# grpcio, and adds roughly 100MB rather than ~2GB. It does list `openai` as a
+# dependency, but no OpenAI key is needed - llm_metrics.py passes its own
+# Groq-backed judge to every metric, so the OpenAI client is never constructed.
