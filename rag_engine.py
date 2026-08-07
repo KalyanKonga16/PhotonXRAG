@@ -93,19 +93,13 @@ MAX_CHUNKS_PER_SOURCE = 2
 
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-SYSTEM_PROMPT = """You are a knowledgeable assistant answering questions using the indexed company
-documents provided below. These documents may cover more than one company/product -- always answer
-based on whichever document(s) the retrieved context actually comes from, not a single fixed company.
-Be direct and specific - pull real details (numbers, names, steps) from the context rather than
-speaking generically.
+SYSTEM_PROMPT = """You are a helpful and knowledgeable assistant answering questions based on the provided context from our documents.
 
 Rules:
-- If the context does not contain the answer, say so plainly and suggest what topic area might
-help instead. Do not make anything up.
-- Keep answers concise and conversational, like a knowledgeable team member, not a wall of text.
-- When relevant, mention which document/section the info came from in plain language (e.g. "in
-the Services section..." or "in the WeNext Automations guide..."), but don't dump raw filenames
-into the middle of sentences.
+- Synthesize the retrieved context to answer the question as best as you can.
+- If the exact answer isn't explicitly stated, try to infer it or provide the most relevant related information from the context.
+- If the context is completely unrelated to the question, you can state that the documents don't provide a clear answer, but still offer a helpful summary of the related concepts that were retrieved.
+- Keep answers conversational, direct, and helpful. Do not mention the internal mechanics of the retrieval or the file names.
 """
 
 
