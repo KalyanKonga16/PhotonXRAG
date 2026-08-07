@@ -151,8 +151,8 @@ st.markdown(
 
     div[data-testid="stChatInput"] textarea { font-family: 'Inter', sans-serif !important; }
 
-    /* Per-answer RAGAS scores, computed by the judge-LLM call in
-       llm_metrics.py and rendered under the reply they belong to.
+    /* Per-answer RAG scores, computed by DeepEval in llm_metrics.py and
+       rendered under the reply they belong to.
        Deliberately quiet -- a metadata strip, not a second headline
        competing with the answer. */
     .score-strip {
@@ -337,8 +337,9 @@ with st.sidebar:
     st.toggle(
         "Score every answer",
         key="score_answers",
-        help="Scores all six RAGAS metrics on each reply using one extra "
-             "judge-LLM call. Adds a couple of seconds per question.",
+        help="Scores all six RAG metrics on each reply with DeepEval. Each "
+             "metric runs its own extraction and verdict calls, so this adds "
+             "a few seconds per question.",
     )
 
 
@@ -377,10 +378,13 @@ def render_eval_controls():
             step=0.5,
             key="eval_pause",
             help="Raise this if Groq starts returning rate-limit errors. Each "
-                 "question costs one answer call plus one judge call.",
+                 "question costs one answer call plus a full DeepEval pass, "
+                 "which is a dozen-plus small calls of its own.",
         )
 
-    est = int(n_eval) * 30 + int(n_eval) * pause
+    # ~60s per question: one answer generation plus a DeepEval pass, whose
+    # six metrics each run their own extraction and verdict calls.
+    est = int(n_eval) * 60 + int(n_eval) * pause
     st.caption(
         f"Answers and scores {int(n_eval)} of {len(questions)} benchmark "
         f"questions in this deployment. Roughly {est // 60}m {est % 60:.0f}s. "
@@ -438,13 +442,17 @@ def _score_tone(value: float, direction: str) -> str:
 
 
 def render_answer_scores(scores: dict | None):
-    """All six RAGAS metrics for the one answer directly above, as judged by
-    llm_metrics.score_answer.
+    """The RAG metrics for the one answer directly above, as computed by
+    DeepEval in llm_metrics.score_answer.
 
     Two tiers on purpose: the chip strip is always visible so every answer
-    carries its own numbers, and the expander holds the judge's stated reason
+    carries its own numbers, and the expander holds DeepEval's stated reason
     for each one -- which is the part that makes a score arguable rather than
-    something you either trust or don't."""
+    something you either trust or don't.
+
+    Renders whichever metrics actually scored, rather than a fixed six: a
+    metric DeepEval could not complete is absent from `values` and is simply
+    not drawn, instead of showing a zero it never measured."""
     if not scores:
         return
     if scores.get("error"):
@@ -478,7 +486,7 @@ def render_answer_scores(scores: dict | None):
         unsafe_allow_html=True,
     )
 
-    with st.expander(f"How accurate is this? — RAGAS scores ({len(chips)} metrics)"):
+    with st.expander(f"How accurate is this? — DeepEval scores ({len(chips)} metrics)"):
         parts = []
         for key, label, direction, _needs_ref in METRICS:
             val = values.get(key)
@@ -500,14 +508,18 @@ def render_answer_scores(scores: dict | None):
             )
         parts.append(
             '<div class="why-foot">'
-            f'Judged by {html.escape(JUDGE_MODEL)} in one call, scored from this '
-            'answer and the context retrieved for it.<br/>'
-            'Context Recall, Context Entity Recall and Answer Correctness have '
-            'no human reference answer to compare against on a live question, so '
-            'they are the judge&rsquo;s estimate - the last one against a '
-            'reference it drafts itself from the retrieved context. For the '
-            'human-reference-measured version, see the system evaluation at the '
-            'bottom of the page.'
+            'Computed by <strong>DeepEval</strong> from this answer and the '
+            f'context retrieved for it, using {html.escape(JUDGE_MODEL)} as the '
+            'evaluation model.<br/>'
+            'Each score is an algorithm, not an opinion: DeepEval extracts the '
+            'individual claims, statements or entities in play, asks the model '
+            'one yes/no verdict per item, and does the arithmetic itself.<br/>'
+            'Context Precision, Context Recall, Context Entity Recall and Answer '
+            'Correctness are defined against a reference answer, which a live '
+            'question does not have - one is drafted from the retrieved context '
+            'alone, without ever seeing the answer above, and used in its place. '
+            'For the human-written-reference version, see the system evaluation '
+            'at the bottom of the page.'
             "</div>"
         )
         st.markdown("".join(parts), unsafe_allow_html=True)
@@ -690,10 +702,12 @@ def render_evaluation():
             if in_app
             else 'Read from the committed <code>eval_summary.json</code>',
             f'Answers: {html.escape(str(summary.get("answer_model", "?")))} '
-            f'&middot; Judge: {html.escape(str(summary.get("judge_model", "?")))}',
+            f'&middot; Scored by DeepEval using '
+            f'{html.escape(str(summary.get("judge_model", "?")))}',
             'Every question here has a known-correct reference answer, so Context '
-            'Recall and Context Entity Recall are measured against it and Answer '
-            'Correctness is available &mdash; none of which a live question allows.',
+            'Precision, Context Recall, Context Entity Recall and Answer '
+            'Correctness are measured against a human-written reference rather '
+            'than a synthesized one &mdash; which a live question cannot offer.',
         ]
         parts.append('<div class="eval-foot">' + "<br/>".join(foot) + "</div>")
         st.markdown("".join(parts), unsafe_allow_html=True)
