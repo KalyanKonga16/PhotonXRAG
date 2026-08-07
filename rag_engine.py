@@ -28,10 +28,34 @@ COLLECTION_NAME = "photonxtech"
 EMBED_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
-# Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml)
-# NOTE: Groq deprecated llama-3.3-70b-versatile on 2026-06-17. openai/gpt-oss-120b
-# is Groq's recommended replacement (faster inference, similar quality tier).
-LLM_MODEL_NAME = "llama-3.3-70b-versatile"
+# Set your own key: export GROQ_API_KEY=... (or put it in .streamlit/secrets.toml).
+# ONE key covers every Groq model - keys are per account, not per model - so the
+# answer model here and the judge model in llm_metrics.py both authenticate with
+# GROQ_API_KEY. A second key is only needed to move scoring to another provider.
+#
+# THIS MODEL AND THE JUDGE MODEL MUST DIFFER - see llm_metrics.JUDGE_MODEL for
+# the full reasoning. Groq's token-per-day limit is per model, so keeping them
+# apart means evaluation cannot spend the allowance the chat needs to answer.
+#
+# openai/gpt-oss-120b replaces llama-3.3-70b-versatile, which Groq deprecated on
+# 2026-06-17. It is Groq's recommended successor - same quality tier, faster
+# inference - and carries a 200k/day free-tier token allowance against
+# llama-3.3's 100k, which roughly doubles how many questions a free key answers.
+LLM_MODEL_NAME = os.environ.get("ANSWER_MODEL", "openai/gpt-oss-120b")
+
+# gpt-oss models think before answering, and those reasoning tokens are billed
+# like any other output token. "low" is a deliberate choice rather than a
+# default: this task is grounded extraction from text already retrieved for the
+# model, which does not reward deliberation, and on a free tier the tokens saved
+# are questions answered. Raise it if answers start feeling shallow.
+ANSWER_REASONING_EFFORT = os.environ.get("ANSWER_REASONING_EFFORT", "low")
+
+
+def _reasoning_kwargs(model: str) -> dict:
+    """reasoning_effort is a gpt-oss feature; other models reject it as an
+    unknown field, so it is sent only where it is understood. Keeps
+    ANSWER_MODEL free to point back at llama-3.3 or anything else."""
+    return {"reasoning_effort": ANSWER_REASONING_EFFORT} if "gpt-oss" in model else {}
 
 DENSE_TOP_K = 20
 BM25_TOP_K = 20
@@ -302,8 +326,13 @@ Answer the current question using the context above."""}
         stream=True,
         temperature=0.7,
         max_tokens=1024,
+        **_reasoning_kwargs(LLM_MODEL_NAME),
     )
 
+    # gpt-oss streams its reasoning in a separate `delta.reasoning` field rather
+    # than mixing it into `delta.content`, so reading content alone yields the
+    # answer only - no <think> block ever reaches the chat bubble. The falsy
+    # check also covers the content-less deltas sent while the model reasons.
     for chunk in response:
         if chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
