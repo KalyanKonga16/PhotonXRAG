@@ -2,7 +2,7 @@
 PhotonX RAG - corpus-level evaluation
 -------------------------------------
 Runs the real pipeline in rag_engine.py over every question in
-eval_dataset.json, scores each answer with the judge in llm_metrics.py, and
+eval_dataset.json, scores each answer with DeepEval via llm_metrics.py, and
 writes aggregate numbers to eval_summary.json. app.py renders that file as the
 system-level report card at the bottom of the page.
 
@@ -14,21 +14,27 @@ system-level report card at the bottom of the page.
 
 WHY THIS IS A SEPARATE SCRIPT AND NOT A BUTTON IN THE APP
 ---------------------------------------------------------
-Each question costs a retrieval pass, an answer generation, and a judge call.
-Over a full set that is minutes of wall-clock and dozens of Groq requests -
-enough to hit a free-tier rate limit and long enough to trip a Streamlit
-Cloud request timeout. So it runs here, offline, on demand; the app only ever
-reads the committed result. Same reason the numbers carry a timestamp: they
-describe the system as of that run, not as of page load.
+Each question costs a retrieval pass, an answer generation, and a full
+DeepEval scoring pass - and DeepEval breaks each metric into several small
+extraction/verdict calls, so that is well over a dozen Groq requests per
+question. Over a full set that is minutes of wall-clock and hundreds of
+requests - enough to hit a free-tier rate limit and long enough to trip a
+Streamlit Cloud request timeout. So it runs here, offline, on demand; the app
+only ever reads the committed result. Same reason the numbers carry a
+timestamp: they describe the system as of that run, not as of page load.
+
+Use --sleep if Groq starts returning 429s, and DEEPEVAL_MAX_WORKERS=1 to make
+each question's metrics run one at a time instead of three at a time.
 
 HOW THIS DIFFERS FROM THE PER-ANSWER SCORES
 -------------------------------------------
-The chat UI scores whatever a user just asked, with no reference answer to
-compare against. This scores a fixed set where every question has a
-known-correct reference, which buys three things the live path cannot have:
-Context Recall and Context Entity Recall measured as RAGAS actually defines
-them, Answer Correctness, and comparability - the same questions rerun after a
-change in chunking, reranking or prompting produce numbers you can diff.
+The chat UI scores whatever a user just asked, which has no reference answer -
+so one is synthesized blind from the retrieved context to satisfy the four
+reference-based metrics. This scores a fixed set where every question has a
+human-written reference, which buys two things the live path cannot have:
+those four metrics measured against real ground truth, and comparability - the
+same questions rerun after a change in chunking, reranking or prompting
+produce numbers you can diff.
 """
 
 from __future__ import annotations
@@ -83,8 +89,9 @@ def load_dataset(path: Path) -> list[dict]:
         reference = str(item.get("reference") or item.get("ground_truth") or "").strip()
         if not reference:
             print(
-                f"  ! '{question[:50]}' has no reference - it will be scored in "
-                f"live mode, without Answer Correctness.",
+                f"  ! '{question[:50]}' has no reference - it will fall back to "
+                f"a synthesized one, so its four reference-based metrics are "
+                f"not measured against ground truth.",
                 file=sys.stderr,
             )
         cleaned.append(
@@ -255,9 +262,9 @@ def main() -> int:
         print(f"\n{e}\nRun `python ingest.py` first.", file=sys.stderr)
         return 1
 
-    print(f"Answering + scoring {len(items)} questions.")
-    print(f"  answer model: {LLM_MODEL_NAME}")
-    print(f"  judge model:  {JUDGE_MODEL}\n")
+    print(f"Answering + scoring {len(items)} questions with DeepEval.")
+    print(f"  answer model:     {LLM_MODEL_NAME}")
+    print(f"  evaluation model: {JUDGE_MODEL}\n")
 
     rows = []
     for i, item in enumerate(items, 1):
