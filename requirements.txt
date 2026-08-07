@@ -9,6 +9,13 @@ groq
 streamlit
 deepeval
 
+# Only needed to run the metrics on Gemini instead of Groq (set GOOGLE_API_KEY
+# to switch - see llm_metrics.JUDGE_MODEL). deepeval does NOT pull this in
+# itself, and its GeminiModel raises a clear "requires the google.genai
+# package" error without it. ~29MB. Delete this line if you are staying on
+# Groq for scoring; nothing else imports it.
+google-genai
+
 # Per-answer scoring (llm_metrics.py) runs on `deepeval`, which implements each
 # metric as a published algorithm - statement extraction, per-statement
 # verdicts, then arithmetic in Python - instead of asking one LLM call to
